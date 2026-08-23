@@ -1,0 +1,20 @@
+# token
+token.txt
+*.token
+.env
+
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# downloads
+downloads/
+*.mp4
+*.mp3
+*.mkv
+*.webm
+
+# system
+xd-bot.service.old
