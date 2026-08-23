@@ -17,6 +17,7 @@ import glob
 import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 
@@ -41,6 +42,11 @@ DOC_LIMIT = 50 * 1024 * 1024      # same limit for document
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# Resolve yt-dlp binary: PATH first (dev shells), then known venv installs.
+YTDLP = shutil.which("yt-dlp") or "/usr/local/lib/hermes-agent/venv/bin/yt-dlp"
+if not os.path.isfile(YTDLP):
+    YTDLP = shutil.which("yt-dlp") or "yt-dlp"
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
@@ -63,7 +69,7 @@ QUALITIES = {
 def run_ytdlp(url: str, quality: str, audio_only: bool) -> tuple[str | None, str | None]:
     out_template = os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s")
     cmd = [
-        "yt-dlp",
+        YTDLP,
         "--no-playlist",
         "--no-warnings",
         "--restrict-filenames",
