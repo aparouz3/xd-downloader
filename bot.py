@@ -77,6 +77,11 @@ def run_ytdlp(url: str, quality: str, audio_only: bool) -> tuple[str | None, str
         "-o", out_template,
         "--max-filesize", "1900M",
     ]
+    # Cookies file (e.g. cookies.txt from "Get cookies.txt LOCALLY" extension)
+    # fixes YouTube/Instagram bot-checks on datacenter IPs.
+    cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    if os.path.isfile(cookies_file):
+        cmd += ["--cookies", cookies_file]
     if audio_only:
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "5"]
     else:
