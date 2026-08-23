@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/root/xd-downloader
-Environment=XD_BOT_TOKEN=8903556855:AAHSVVR5_tprYpbMbnk8TJvHsRvtus7SToQ
+Environment=XD_BOT_TOKEN=8903556855:CHANGE_ME
 Environment=ALLOWED_USER_ID=5669842121
 ExecStart=/usr/local/lib/hermes-agent/venv/bin/python3 /root/xd-downloader/bot.py
 Restart=always

@@ -32,7 +32,7 @@ from telegram.ext import (
 )
 
 # ── Config ──────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("XD_BOT_TOKEN", "8903556855:AAHSVVR5_tprYpbMbnk8TJvHsRvtus7SToQ")
+BOT_TOKEN = os.environ.get("XD_BOT_TOKEN", "8903556855:CHANGE_ME")
 # Only this user may use the bot (owner's Telegram user id, NOT channel id).
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "5669842121"))
 DOWNLOAD_DIR = os.environ.get("XD_DOWNLOAD_DIR", "/root/xd-downloader/downloads")
