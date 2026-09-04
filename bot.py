@@ -7,21 +7,29 @@ Flow:
   1. user sends a link  -> bot asks for quality (inline keyboard)
   2. user picks quality -> yt-dlp downloads -> bot delivers video/audio
 
+Special case — X/Twitter multi-photo posts:
+  photos are fetched via the fxtwitter API and delivered as one
+  Telegram media group (album) — no quality picker needed.
+
 Supports: YouTube, X/Twitter, Instagram, TikTok, Reddit, Facebook,
 Vimeo, SoundCloud + 1000+ more sites (anything yt-dlp handles).
 
 Access control: only ALLOWED_USER_ID (the owner) can use it.
 """
 
+import asyncio
 import glob
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
+import urllib.request
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -39,6 +47,7 @@ ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "5669842121"))
 DOWNLOAD_DIR = os.environ.get("XD_DOWNLOAD_DIR", "/root/xd-downloader/downloads")
 TG_FILE_LIMIT = 50 * 1024 * 1024  # bot API hard limit for video upload
 DOC_LIMIT = 50 * 1024 * 1024      # same limit for document
+TG_ALBUM_LIMIT = 10               # Telegram max items per media group
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -53,6 +62,15 @@ logging.basicConfig(
 log = logging.getLogger("xd-bot")
 
 URL_RE = re.compile(r"https?://\S+")
+X_URL_RE = re.compile(
+    r"https?://(?:www\.|mobile\.)?(?:x|twitter)\.com/[^/]+/status/(\d+)", re.IGNORECASE
+)
+FXTWITTER_API = "https://api.fxtwitter.com"
+VXTWITTER_API = "https://api.vxtwitter.com"
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
 ACTIVE = set()               # chat ids currently downloading
 PENDING_URL = {}             # chat_id -> {"url": ..., "msg_id": ...} awaiting quality choice
 
@@ -107,6 +125,60 @@ def run_ytdlp(url: str, quality: str, audio_only: bool) -> tuple[str | None, str
     return max(fresh, key=os.path.getmtime), None
 
 
+# ── X/Twitter multi-photo support (fxtwitter API, no auth) ─────────────
+def fetch_x_tweet(tweet_id: str) -> dict | None:
+    """Fetch tweet metadata from fxtwitter (fallback: vxtwitter). None on failure."""
+    # fxtwitter/vxtwitter path shape: /:user/status/:id — user segment is
+    # ignored by the API, but it must be present for the route to resolve.
+    path = f"/i/status/{tweet_id}"
+    for api in (FXTWITTER_API, VXTWITTER_API):
+        try:
+            req = urllib.request.Request(
+                f"{api}{path}", headers={"User-Agent": BROWSER_UA}
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.load(resp)
+        except Exception as e:
+            log.warning("x api %s failed for %s: %s", api, tweet_id, e)
+    return None
+
+
+def x_media_urls(tweet_id: str) -> tuple[list[str], int]:
+    """Return (photo_urls, video_count) for an X post. Photos keep ?name=orig."""
+    data = fetch_x_tweet(tweet_id)
+    if not data:
+        return [], 0
+    tweet = (data or {}).get("tweet") or {}
+    media = tweet.get("media") or {}
+    photos = [p.get("url") for p in media.get("photos", []) if p.get("url")]
+    videos = media.get("videos") or []
+    return photos, len(videos)
+
+
+def download_x_photos(urls: list[str]) -> tuple[list[str], int]:
+    """Download photos into a temp dir. Returns (local_paths, failed_count)."""
+    tmpdir = tempfile.mkdtemp(prefix="xd-x-", dir=DOWNLOAD_DIR)
+    paths, failed = [], 0
+    for i, u in enumerate(urls):
+        dest = os.path.join(tmpdir, f"{i + 1:02d}.jpg")
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": BROWSER_UA})
+            with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as fh:
+                fh.write(resp.read())
+            if os.path.getsize(dest) > 0:
+                paths.append(dest)
+            else:
+                failed += 1
+        except Exception as e:
+            log.warning("x photo %s failed: %s", u, e)
+            failed += 1
+    return paths, failed
+
+
+def cleanup_dir(path: str):
+    shutil.rmtree(path, ignore_errors=True)
+
+
 # ── Access control ──────────────────────────────────────────────────────
 def is_owner(update: Update) -> bool:
     return update.effective_user is not None and update.effective_user.id == ALLOWED_USER_ID
@@ -120,6 +192,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎬 لینک بفرست، کیفیت رو انتخاب کن، ویدیو تحویل بگیر\n\n"
         "• یوتیوب / X / اینستاگرام / تیک‌تاک / ردیت و ۱۰۰۰+ سایت دیگه\n"
+        "• پست‌های چندعکسی X → همهٔ عکسها یه‌جا میاد (بدون انتخاب کیفیت)\n"
         "• /mp3 قبل از لینک = فقط صدا (بدون انتخاب کیفیت)\n"
         "• سقف تلگرام: ~۵۰MB — کیفیت‌های بالاتر ممکنه جا نشه"
     )
@@ -148,7 +221,8 @@ async def ask_quality(update: Update, url: str):
 async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    url = extract_url(update.message.text or "")
+    text = update.message.text or ""
+    url = extract_url(text)
     if not url:
         await update.message.reply_text("لینک معتبر پیدا نکردم. یه URL کامل بفرست.")
         return
@@ -156,7 +230,70 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if chat_id in ACTIVE:
         await update.message.reply_text("یه دانلود در جریانه — صبر کن تموم شه ⏳")
         return
+
+    # X/Twitter multi-photo fast path: no quality picker, album straight away.
+    xm = X_URL_RE.search(url)
+    if xm and not text.strip().startswith("/mp3"):
+        await do_x_photos(update, ctx, xm.group(1))
+        return
+
     await ask_quality(update, url)
+
+
+async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: str):
+    """Fetch all photos of an X post and send them as one media group."""
+    chat_id = update.effective_chat.id
+    ACTIVE.add(chat_id)
+    wait_msg = None
+    tmpdir = None
+    try:
+        wait_msg = await update.message.reply_text("🐦 در حال گرفتن عکس‌های پست X...")
+        photos, videos = await asyncio.to_thread(x_media_urls, tweet_id)
+        if not photos:
+            hint = (
+                "این پست عکس نداره (ویدیو یا متنیه) — با انتخاب کیفیت معمولی بفرستش."
+                if videos
+                else "عکسی از این پست پیدا نکردم (پست خصوصی/حذف‌شده یا API در دسترس نیست)."
+            )
+            await wait_msg.edit_text(f"❌ {hint}")
+            return
+        total = len(photos)
+        await wait_msg.edit_text(f"🐦 {total} عکس پیدا شد — ⏳ در حال دانلود...")
+        paths, failed = await asyncio.to_thread(download_x_photos, photos)
+        if not paths:
+            await wait_msg.edit_text("❌ دانلود عکس‌ها شکست خورد (twimg در دسترس نیست).")
+            return
+        tmpdir = os.path.dirname(paths[0])
+        await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+
+        # Telegram albums: max 10 items per send; send in chunks of 10.
+        for chunk_start in range(0, len(paths), TG_ALBUM_LIMIT):
+            chunk = paths[chunk_start:chunk_start + TG_ALBUM_LIMIT]
+            handles = [open(p, "rb") for p in chunk]
+            media = [InputMediaPhoto(media=h) for h in handles]
+            try:
+                await ctx.bot.send_media_group(chat_id, media)
+            finally:
+                for h in handles:
+                    h.close()
+        failed_note = f"\n⚠️ {failed} عکس دانلود نشد." if failed else ""
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+        if failed:
+            await update.message.reply_text(f"✅ عکس‌ها ارسال شد.{failed_note}")
+    except Exception as e:
+        log.exception("x photos failed")
+        try:
+            if wait_msg:
+                await wait_msg.edit_text(f"❌ خطا: {str(e)[:200]}")
+        except Exception:
+            pass
+    finally:
+        if tmpdir:
+            cleanup_dir(tmpdir)
+        ACTIVE.discard(chat_id)
 
 
 async def on_mp3(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -202,7 +339,7 @@ async def do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str,
             wait_msg = await update.message.reply_text(f"{label} — ⏳ در حال دانلود...")
 
         await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
-        path, err = await asyncio_to_thread(run_ytdlp, url, quality, audio_only)
+        path, err = await asyncio.to_thread(run_ytdlp, url, quality, audio_only)
         if err:
             await wait_msg.edit_text(f"❌ {err}")
             return
@@ -241,18 +378,19 @@ async def do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str,
         ACTIVE.discard(chat_id)
 
 
-async def asyncio_to_thread(fn, *args):
-    import asyncio
-    return await asyncio.to_thread(fn, *args)
-
-
 def main():
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(False).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("mp3", on_mp3))
     app.add_handler(CallbackQueryHandler(on_quality_pick, pattern=r"^q:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_link))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND
+            & (filters.Entity("url") | filters.Entity("text_link")),
+            on_link,
+        )
+    )
     log.info(f"XD bot polling started (owner={ALLOWED_USER_ID})")
     app.run_polling(drop_pending_updates=True)
 
