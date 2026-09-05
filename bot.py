@@ -156,6 +156,65 @@ def x_media_urls(tweet_id: str) -> tuple[list[str], int]:
     return photos, len(videos)
 
 
+def x_video_variants(tweet_id: str) -> list[dict]:
+    """Return X post video variants (direct mp4s with bitrates) via fxtwitter/vxtwitter.
+
+    Each entry: {"url", "bitrate", "duration", "width", "height"}.
+    """
+    data = fetch_x_tweet(tweet_id)
+    if not data:
+        return []
+    media = ((data or {}).get("tweet") or {}).get("media") or {}
+    out = []
+    for v in media.get("videos", []):
+        duration = v.get("duration")
+        width, height = v.get("width"), v.get("height")
+        variants = [x for x in (v.get("variants") or []) if "video/mp4" in (x.get("content_type") or "")]
+        if not variants and v.get("url", "").startswith("https://video.twimg.com"):
+            variants = [{"url": v["url"], "bitrate": 0}]
+        for x in variants:
+            out.append({
+                "url": x.get("url"),
+                "bitrate": x.get("bitrate") or 0,
+                "duration": duration,
+                "width": width,
+                "height": height,
+            })
+    return [x for x in out if x.get("url")]
+
+
+def _pick_x_video_variant(variants: list[dict], max_bytes: int = 49_000_000) -> dict | None:
+    """Pick the best video variant whose estimated size fits the Telegram 50MB bot limit."""
+    if not variants:
+        return None
+    def est(v):
+        return v["bitrate"] * (v.get("duration") or 60) / 8
+    fitted = [v for v in variants if est(v) <= max_bytes]
+    if fitted:
+        return max(fitted, key=lambda v: est(v))
+    return min(variants, key=lambda v: est(v))
+
+
+def download_x_video(tweet_id: str) -> tuple[str | None, str | None]:
+    """Download an X post video directly from twimg (no auth). Returns (path, error)."""
+    variants = x_video_variants(tweet_id)
+    if not variants:
+        return None, "ویدیویی برای این پست پیدا نکردم (خصوصی/حذف‌شده یا API در دسترس نیست)."
+    variant = _pick_x_video_variant(variants)
+    if not variant:
+        return None, "ویدیویی برای این پست پیدا نکردم (خصوصی/حذف‌شده یا API در دسترس نیست)."
+    dest = os.path.join(DOWNLOAD_DIR, f"x_{tweet_id}.mp4")
+    try:
+        req = urllib.request.Request(variant["url"], headers={"User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=300) as resp, open(dest, "wb") as fh:
+            shutil.copyfileobj(resp, fh)
+    except Exception as e:
+        return None, f"دانلود ویدیو شکست خورد: {str(e)[:150]}"
+    if not os.path.isfile(dest) or os.path.getsize(dest) == 0:
+        return None, "فایل ویدیو خالی بود."
+    return dest, None
+
+
 def download_x_photos(urls: list[str]) -> tuple[list[str], int]:
     """Download photos into a temp dir. Returns (local_paths, failed_count)."""
     tmpdir = tempfile.mkdtemp(prefix="xd-x-", dir=DOWNLOAD_DIR)
@@ -493,13 +552,31 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
     wait_msg = None
     tmpdir = None
     try:
-        wait_msg = await update.message.reply_text("🐦 در حال گرفتن عکس‌های پست X...")
+        wait_msg = await update.message.reply_text("🐦 در حال بررسی پست X...")
         photos, videos = await asyncio.to_thread(x_media_urls, tweet_id)
+        if not photos and videos:
+            # Video post (dead end before: quality picker never reached X links) →
+            # download the video directly from twimg via fxtwitter variants.
+            await wait_msg.edit_text("🎬 ویدیوی X — ⏳ در حال دانلود...")
+            path, err = await asyncio.to_thread(download_x_video, tweet_id)
+            if err or not path:
+                await wait_msg.edit_text(f"❌ {err or 'خطای نامشخص'}")
+                return
+            size = os.path.getsize(path)
+            caption = f"🐦 ویدیوی X ({size // (1024*1024)}MB)" if size > 1024 * 1024 else "🐦 ویدیوی X"
+            with open(path, "rb") as fh:
+                await update.effective_chat.send_video(
+                    video=fh, caption=caption, supports_streaming=True
+                )
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+            os.remove(path)
+            return
         if not photos:
             hint = (
-                "این پست عکس نداره (ویدیو یا متنیه) — با انتخاب کیفیت معمولی بفرستش."
-                if videos
-                else "عکسی از این پست پیدا نکردم (پست خصوصی/حذف‌شده یا API در دسترس نیست)."
+                "این پست ویدیو یا عکسی نداره (پست خصوصی/حذف‌شده یا API در دسترس نیست)."
             )
             await wait_msg.edit_text(f"❌ {hint}")
             return
