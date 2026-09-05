@@ -222,23 +222,34 @@ def _ig_profile_from_instagram_api(username: str) -> str | None:
 
 
 def _ig_profile_from_instastatistics(username: str) -> str | None:
-    """Fallback: instastatistics embeds the IG CDN profile avatar (needs a real browser via CDP)."""
+    """Fallback: instastatistics embeds the IG CDN profile avatar (needs a real browser via CDP).
+
+    The requested user's own avatar is matched by the page's profile header (h1/h2 text) or the
+    img alt text containing the username — never the generic first image on the page.
+    """
     if not os.path.isfile("/root/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome"):
         if not (shutil.which("chromium") or shutil.which("google-chrome")):
             return None
+    safe_user = json.dumps(username)  # quoted JS string literal
     js_probe = (
         "(async () => {"
-        "  for (let i = 0; i < 10; i++) {"
+        "  const user = " + safe_user + ".toLowerCase().replace(/^@/, '');"
+        "  const norm = s => (s || '').toLowerCase().replace(/^@/, '');"
+        "  for (let i = 0; i < 12; i++) {"
         "    await new Promise(r => setTimeout(r, 1000));"
-        "    const img = [...document.querySelectorAll('img')].find("
-        "      i => (i.alt || '').toLowerCase().includes('elin') && (i.src || '').includes('api/img'))"
-        "      || [...document.querySelectorAll('img')].find(i => (i.src || '').includes('api/img'));"
-        "    if (img) {"
-        "      const u = new URL(img.src).searchParams.get('url');"
-        "      if (u) return u;"
+        "    const imgs = [...document.querySelectorAll('img')].filter("
+        "      i => (i.src || '').includes('api/img'));"
+        "    const h1 = document.querySelector('h1, h2, [class*=\"username\"]');"
+        "    const uname = norm(h1 && h1.textContent);"
+        "    const target = imgs.find(i => norm(i.alt) === user)"
+        "      || imgs.find(i => norm(i.alt).includes(user) && user.length > 2)"
+        "      || (uname && imgs.find(i => norm(i.alt).includes(uname) && uname.length > 2));"
+        "    if (target) {"
+        "      const u = new URL(target.src).searchParams.get('url');"
+        "      if (u) return JSON.stringify({alt: target.alt || '', url: u});"
         "    }"
         "  }"
-        "  return 'NOT_FOUND';"
+        "  return JSON.stringify({err: 'avatar not found for ' + user});"
         "})()"
     )
     try:
@@ -300,9 +311,19 @@ def _ig_profile_via_cdp(username: str, js_probe: str) -> str | None:
     except Exception as e:
         log.info("ig cdp extract failed for %s: %s", username, e)
         return None
-    if not val or val in ("NOT_FOUND", "NO_URL_PARAM"):
+    if not val or not val.startswith("{"):
         return None
-    return val if val.startswith("http") else None
+    try:
+        parsed = json.loads(val)
+    except Exception:
+        return None
+    url = parsed.get("url") or ""
+    alt = parsed.get("alt") or ""
+    if not url.startswith("http"):
+        log.info("ig cdp: no avatar for %s (%s)", username, parsed.get("err") or alt)
+        return None
+    log.info("ig cdp: matched avatar for %s via alt=%r", username, alt)
+    return url
 
 
 def fetch_ig_profile_pic_url(username: str) -> str | None:
