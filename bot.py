@@ -28,6 +28,7 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+import urllib.parse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ChatAction
@@ -179,6 +180,156 @@ def cleanup_dir(path: str):
     shutil.rmtree(path, ignore_errors=True)
 
 
+# ── Instagram profile picture support (no auth, multi-source) ───────────
+IG_USER_RE = re.compile(
+    r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)/?(?:[?#].*)?$",
+    re.IGNORECASE,
+)
+IG_STORY_RE = re.compile(r"instagram\.com/stories/", re.IGNORECASE)
+IG_P_RE = re.compile(r"instagram\.com/(p|reel|tv)/", re.IGNORECASE)
+
+
+def _http_get(url: str, headers: dict | None = None, timeout: int = 25) -> bytes:
+    """Blocking GET returning raw bytes. Raises on HTTP errors."""
+    h = {"User-Agent": BROWSER_UA}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _ig_profile_from_instagram_api(username: str) -> str | None:
+    """Try Instagram's own web profile API (best quality: profile_pic_url_hd)."""
+    app_ids = ("936619743392459", "1217981644879628")
+    for app_id in app_ids:
+        try:
+            data = _http_get(
+                "https://www.instagram.com/api/v1/users/web_profile_info/?"
+                + urllib.parse.urlencode({"username": username}),
+                headers={
+                    "x-ig-app-id": app_id,
+                    "x-requested-with": "XMLHttpRequest",
+                    "accept": "*/*",
+                    "referer": f"https://www.instagram.com/{username}/",
+                },
+            )
+            user = json.loads(data)["data"]["user"]
+            return user.get("profile_pic_url_hd") or user.get("profile_pic_url")
+        except Exception as e:
+            log.info("ig api %s failed for %s: %s", app_id, username, e)
+    return None
+
+
+def _ig_profile_from_instastatistics(username: str) -> str | None:
+    """Fallback: instastatistics embeds the IG CDN profile avatar (needs a real browser via CDP)."""
+    if not os.path.isfile("/root/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome"):
+        if not (shutil.which("chromium") or shutil.which("google-chrome")):
+            return None
+    js_probe = (
+        "(async () => {"
+        "  for (let i = 0; i < 10; i++) {"
+        "    await new Promise(r => setTimeout(r, 1000));"
+        "    const img = [...document.querySelectorAll('img')].find("
+        "      i => (i.alt || '').toLowerCase().includes('elin') && (i.src || '').includes('api/img'))"
+        "      || [...document.querySelectorAll('img')].find(i => (i.src || '').includes('api/img'));"
+        "    if (img) {"
+        "      const u = new URL(img.src).searchParams.get('url');"
+        "      if (u) return u;"
+        "    }"
+        "  }"
+        "  return 'NOT_FOUND';"
+        "})()"
+    )
+    try:
+        # Use CDP on the persistent local Chrome daemon (port 9222) if present.
+        req = urllib.request.Request("http://127.0.0.1:9222/json/version", method="GET")
+        urllib.request.urlopen(req, timeout=5)
+        return _ig_profile_via_cdp(username, js_probe)
+    except Exception:
+        return None
+
+
+def _ig_profile_via_cdp(username: str, js_probe: str) -> str | None:
+    """Open the profile stats page in local Chrome (CDP :9222) and extract the CDN avatar URL."""
+    import base64
+
+    async def _run():
+        import websockets
+        req = urllib.request.Request(
+            "http://127.0.0.1:9222/json/new?about:blank", method="PUT"
+        )
+        tab = json.load(urllib.request.urlopen(req, timeout=15))
+        pending: dict = {}
+
+        async with websockets.connect(
+            tab["webSocketDebuggerUrl"], max_size=80 * 1024 * 1024
+        ) as ws:
+            mid = 0
+
+            async def reader():
+                try:
+                    while True:
+                        msg = json.loads(await ws.recv())
+                        if "id" in msg and msg["id"] in pending:
+                            pending.pop(msg["id"]).set_result(msg)
+                except Exception:
+                    pass
+
+            async def cmd(method, params=None):
+                nonlocal mid
+                mid += 1
+                fut = asyncio.get_event_loop().create_future()
+                pending[mid] = fut
+                await ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+                return await asyncio.wait_for(fut, timeout=30)
+
+            rt = asyncio.create_task(reader())
+            await cmd("Page.enable")
+            await cmd("Runtime.enable")
+            await cmd("Page.navigate", {"url": f"https://instastatistics.com/{username}"})
+            await asyncio.sleep(14)
+            res = await cmd("Runtime.evaluate", {
+                "expression": js_probe, "returnByValue": True, "awaitPromise": True
+            })
+            rt.cancel()
+            return (res.get("result", {}).get("result", {}).get("value") or "NOT_FOUND")
+
+    try:
+        val = asyncio.run(_run())
+    except Exception as e:
+        log.info("ig cdp extract failed for %s: %s", username, e)
+        return None
+    if not val or val in ("NOT_FOUND", "NO_URL_PARAM"):
+        return None
+    return val if val.startswith("http") else None
+
+
+def fetch_ig_profile_pic_url(username: str) -> str | None:
+    """Return the profile picture URL for an IG username (HD first)."""
+    return _ig_profile_from_instagram_api(username) or _ig_profile_from_instastatistics(
+        username
+    )
+
+
+def download_ig_profile_pic(username: str) -> tuple[str | None, str | None]:
+    """Download the profile picture. Returns (local_path, error)."""
+    try:
+        url = fetch_ig_profile_pic_url(username)
+        if not url:
+            return None, "عکس پروفایل پیدا نشد (پروفایل خصوصی/حذف‌شده یا محدودیت دسترسی)."
+        dest = os.path.join(DOWNLOAD_DIR, f"ig_{username}_profile.jpg")
+        data = _http_get(url, headers={"User-Agent": BROWSER_UA}, timeout=60)
+        if not data.startswith(b"\xff\xd8") and not data.startswith(b"\x89PNG"):
+            return None, "فایل دانلودشده عکس معتبر نبود."
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        return dest, None
+    except Exception as e:
+        log.warning("ig profile pic %s failed: %s", username, e)
+        return None, f"خطا: {str(e)[:150]}"
+
+
 # ── Access control ──────────────────────────────────────────────────────
 def is_owner(update: Update) -> bool:
     return update.effective_user is not None and update.effective_user.id == ALLOWED_USER_ID
@@ -194,6 +345,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• یوتیوب / X / اینستاگرام / تیک‌تاک / ردیت و ۱۰۰۰+ سایت دیگه\n"
         "• پست‌های چندعکسی X → همهٔ عکسها یه‌جا میاد (بدون انتخاب کیفیت)\n"
         "• /mp3 قبل از لینک = فقط صدا (بدون انتخاب کیفیت)\n"
+        "• /dp username یا لینک پروفایل اینستاگرام = عکس پروفایل\n"
         "• سقف تلگرام: ~۵۰MB — کیفیت‌های بالاتر ممکنه جا نشه"
     )
 
@@ -231,6 +383,12 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("یه دانلود در جریانه — صبر کن تموم شه ⏳")
         return
 
+    # Instagram profile URL (no /p/ /reel/ /stories/ path) → send profile picture.
+    ig = IG_USER_RE.match(url)
+    if ig and not IG_P_RE.search(url) and not IG_STORY_RE.search(url):
+        await do_ig_profile(update, ctx, ig.group(1))
+        return
+
     # X/Twitter multi-photo fast path: no quality picker, album straight away.
     xm = X_URL_RE.search(url)
     if xm and not text.strip().startswith("/mp3"):
@@ -238,6 +396,73 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await ask_quality(update, url)
+
+
+async def do_ig_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE, username: str):
+    """Download and send an Instagram user's profile picture."""
+    chat_id = update.effective_chat.id
+    ACTIVE.add(chat_id)
+    wait_msg = None
+    path = None
+    try:
+        wait_msg = await update.message.reply_text(
+            f"👤 @ {username} — ⏳ در حال گرفتن عکس پروفایل..."
+        )
+        await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+        path, err = await asyncio.to_thread(download_ig_profile_pic, username)
+        if err:
+            await wait_msg.edit_text(f"❌ {err}")
+            return
+        with open(path, "rb") as fh:
+            await update.effective_chat.send_photo(
+                photo=fh, caption=f"👤 @{username} — عکس پروفایل"
+            )
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception("ig profile failed")
+        try:
+            if wait_msg:
+                await wait_msg.edit_text(f"❌ خطا: {str(e)[:200]}")
+        except Exception:
+            pass
+    finally:
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        ACTIVE.discard(chat_id)
+
+
+async def on_dp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/dp <username> یا /dp <لینک پروفایل> → عکس پروفایل اینستاگرام"""
+    if not is_owner(update):
+        return
+    text = (update.message.text or "").split(maxsplit=1)
+    arg = text[1].strip() if len(text) > 1 else ""
+    # accept @username, bare username, or a profile URL
+    url = extract_url(arg)
+    if url:
+        ig = IG_USER_RE.match(url)
+        if not ig or IG_P_RE.search(url) or IG_STORY_RE.search(url):
+            await update.message.reply_text(
+                "این لینک پست/استوریه، نه پروفایل. لینک پروفایل بده (مثل instagram.com/username)."
+            )
+            return
+        username = ig.group(1)
+    else:
+        username = arg.lstrip("@").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.]{1,30}", username):
+            await update.message.reply_text("مثل: /dp username یا /dp @username")
+            return
+    chat_id = update.effective_chat.id
+    if chat_id in ACTIVE:
+        await update.message.reply_text("یه دانلود در جریانه — صبر کن تموم شه ⏳")
+        return
+    await do_ig_profile(update, ctx, username)
 
 
 async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: str):
@@ -383,6 +608,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("mp3", on_mp3))
+    app.add_handler(CommandHandler("dp", on_dp))
     app.add_handler(CallbackQueryHandler(on_quality_pick, pattern=r"^q:"))
     app.add_handler(
         MessageHandler(
