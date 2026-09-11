@@ -73,7 +73,7 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 ACTIVE = set()               # chat ids currently downloading
-PENDING_URL = {}             # chat_id -> {"url": ..., "msg_id": ...} awaiting quality choice
+PENDING_URL = {}             # chat_id -> {"url", "msg_id", "user_caption"} awaiting quality choice
 
 # Quality presets: label -> yt-dlp -f selector (height caps keep under 50MB)
 QUALITIES = {
@@ -85,7 +85,8 @@ QUALITIES = {
 
 
 # ── yt-dlp runner (blocking; runs in thread via asyncio.to_thread) ──────
-def run_ytdlp(url: str, quality: str, audio_only: bool) -> tuple[str | None, str | None]:
+def run_ytdlp(url: str, quality: str, audio_only: bool) -> tuple[str | None, str | None, str]:
+    """Returns (local_path, error, post_caption)."""
     out_template = os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s")
     cmd = [
         YTDLP,
@@ -111,10 +112,10 @@ def run_ytdlp(url: str, quality: str, audio_only: bool) -> tuple[str | None, str
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
-        return None, "دانلود بیش از حد طول کشید (timeout)"
+        return None, "دانلود بیش از حد طول کشید (timeout)", ""
     if r.returncode != 0:
         err = (r.stderr or "").strip().splitlines()
-        return None, (err[-1][:300] if err else "خطای نامشخص yt-dlp")
+        return None, (err[-1][:300] if err else "خطای نامشخص yt-dlp"), ""
 
     # newest file in download dir, touched within the last 15 min
     fresh = [
@@ -122,8 +123,28 @@ def run_ytdlp(url: str, quality: str, audio_only: bool) -> tuple[str | None, str
         if time.time() - os.path.getmtime(f) < 900
     ]
     if not fresh:
-        return None, "فایل خروجی پیدا نشد"
-    return max(fresh, key=os.path.getmtime), None
+        return None, None, ""
+    path = max(fresh, key=os.path.getmtime)
+    return path, None, fetch_post_caption(url)
+
+
+def fetch_post_caption(url: str) -> str:
+    """Post caption (description, else title) via yt-dlp metadata-only call.
+    Returns '' on any failure — caption is best-effort, never blocks delivery."""
+    cmd = [YTDLP, "--no-playlist", "--no-warnings", "--skip-download",
+           "--socket-timeout", "30", "-j", url]
+    cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    if os.path.isfile(cookies_file):
+        cmd = cmd[:2] + ["--cookies", cookies_file] + cmd[2:]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if r.returncode != 0:
+            return ""
+        info = json.loads(r.stdout.strip().splitlines()[-1])
+        text = (info.get("description") or "").strip() or (info.get("title") or "").strip()
+        return sanitize_caption(text)
+    except Exception:
+        return ""
 
 
 # ── X/Twitter multi-photo support (fxtwitter API, no auth) ─────────────
@@ -193,6 +214,13 @@ def _pick_x_video_variant(variants: list[dict], max_bytes: int = 49_000_000) -> 
     if fitted:
         return max(fitted, key=lambda v: est(v))
     return min(variants, key=lambda v: est(v))
+
+
+def x_tweet_caption(tweet_id: str) -> str:
+    """Caption (text) of an X post via fxtwitter. Empty string if unavailable."""
+    data = fetch_x_tweet(tweet_id)
+    tweet = (data or {}).get("tweet") or {}
+    return (tweet.get("text") or "").strip()
 
 
 def download_x_video(tweet_id: str) -> tuple[str | None, str | None]:
@@ -435,10 +463,31 @@ def extract_url(text: str) -> str | None:
     return m.group(0) if m else None
 
 
-async def ask_quality(update: Update, url: str):
-    """Show inline keyboard with quality choices, store pending URL."""
+def sanitize_caption(text: str | None) -> str:
+    """Make text safe as a Telegram caption: no HTML tags (message may be sent
+    with parse_mode=HTML), trimmed to the 1024-char caption limit."""
+    if not text:
+        return ""
+    clean = re.sub(r"<[^>]*>", "", str(text)).strip()
+    return clean[:1024]
+
+
+def user_note(text: str | None) -> str:
+    """The user's own note in a message: text with URLs and /mp3 stripped.
+    Empty string if they only sent a bare link."""
+    if not text:
+        return ""
+    stripped = re.sub(r"^/mp3\b", "", text, flags=re.I)
+    stripped = URL_RE.sub("", stripped)
+    return sanitize_caption(stripped)
+
+
+async def ask_quality(update: Update, url: str, user_caption: str = ""):
+    """Show inline keyboard with quality choices, store pending URL + caption."""
     msg = await update.message.reply_text("📥 لینک دریافت شد. کیفیت مورد نظر؟")
-    PENDING_URL[update.effective_chat.id] = {"url": url, "msg_id": msg.message_id}
+    PENDING_URL[update.effective_chat.id] = {
+        "url": url, "msg_id": msg.message_id, "user_caption": user_caption,
+    }
     kb = [
         [
             InlineKeyboardButton("480p", callback_data="q:480"),
@@ -472,10 +521,10 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # X/Twitter multi-photo fast path: no quality picker, album straight away.
     xm = X_URL_RE.search(url)
     if xm and not text.strip().startswith("/mp3"):
-        await do_x_photos(update, ctx, xm.group(1))
+        await do_x_photos(update, ctx, xm.group(1), user_caption=text)
         return
 
-    await ask_quality(update, url)
+    await ask_quality(update, url, user_caption=text)
 
 
 async def do_ig_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE, username: str):
@@ -545,8 +594,10 @@ async def on_dp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await do_ig_profile(update, ctx, username)
 
 
-async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: str):
-    """Fetch all photos of an X post and send them as one media group."""
+async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: str,
+                      user_caption: str = ""):
+    """Fetch all photos of an X post and send them as one media group.
+    Caption priority: text the user sent with the link > post text (fxtwitter)."""
     chat_id = update.effective_chat.id
     ACTIVE.add(chat_id)
     wait_msg = None
@@ -563,7 +614,15 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
                 await wait_msg.edit_text(f"❌ {err or 'خطای نامشخص'}")
                 return
             size = os.path.getsize(path)
-            caption = f"🐦 ویدیوی X ({size // (1024*1024)}MB)" if size > 1024 * 1024 else "🐦 ویدیوی X"
+            post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
+            own = user_note(user_caption)
+            if own:
+                # user wrote their own note besides the link — use it
+                caption = own
+            elif post_text:
+                caption = post_text
+            else:
+                caption = f"🐦 ویدیوی X ({size // (1024*1024)}MB)" if size > 1024 * 1024 else "🐦 ویدیوی X"
             with open(path, "rb") as fh:
                 await update.effective_chat.send_video(
                     video=fh, caption=caption, supports_streaming=True
@@ -586,6 +645,10 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
         if not paths:
             await wait_msg.edit_text("❌ دانلود عکس‌ها شکست خورد (twimg در دسترس نیست).")
             return
+        # Album caption: user's own note > post text from fxtwitter.
+        post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
+        own = user_note(user_caption)
+        album_caption = own or post_text
         tmpdir = os.path.dirname(paths[0])
         await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
 
@@ -594,6 +657,8 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             chunk = paths[chunk_start:chunk_start + TG_ALBUM_LIMIT]
             handles = [open(p, "rb") for p in chunk]
             media = [InputMediaPhoto(media=h) for h in handles]
+            if album_caption:
+                media[0].caption = album_caption
             try:
                 await ctx.bot.send_media_group(chat_id, media)
             finally:
@@ -626,7 +691,7 @@ async def on_mp3(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not url:
         await update.message.reply_text("مثل: /mp3 https://...")
         return
-    await do_download(update, ctx, url, quality="audio")
+    await do_download(update, ctx, url, quality="audio", user_caption=update.message.text or "")
 
 
 async def on_quality_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -643,11 +708,13 @@ async def on_quality_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     quality = {"480": "480p", "720": "720p", "1080": "1080p", "best": "Best"}.get(
         q.data.split(":")[1], "720p"
     )
-    await do_download(update, ctx, pending["url"], quality=quality, edit_msg_id=pending["msg_id"])
+    await do_download(update, ctx, pending["url"], quality=quality, edit_msg_id=pending["msg_id"],
+                      user_caption=pending.get("user_caption", ""))
 
 
 async def do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str,
-                      quality: str, edit_msg_id: int | None = None):
+                      quality: str, edit_msg_id: int | None = None,
+                      user_caption: str = ""):
     chat_id = update.effective_chat.id
     audio_only = quality == "audio"
     ACTIVE.add(chat_id)
@@ -662,13 +729,15 @@ async def do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str,
             wait_msg = await update.message.reply_text(f"{label} — ⏳ در حال دانلود...")
 
         await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
-        path, err = await asyncio.to_thread(run_ytdlp, url, quality, audio_only)
+        path, err, post_caption = await asyncio.to_thread(run_ytdlp, url, quality, audio_only)
         if err:
             await wait_msg.edit_text(f"❌ {err}")
             return
 
         size = os.path.getsize(path)
-        caption = os.path.splitext(os.path.basename(path))[0][:60]
+        fallback = os.path.splitext(os.path.basename(path or ""))[0][:60]
+        # user's own note (text besides the link) > post caption > filename
+        caption = user_note(user_caption) or post_caption or fallback
         if size > DOC_LIMIT:
             await wait_msg.edit_text(
                 f"❌ فایل {size // (1024*1024)}MB است — بزرگ‌تر از سقف ۵۰MB تلگرام.\n"
