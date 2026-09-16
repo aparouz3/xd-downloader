@@ -656,9 +656,11 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
         for chunk_start in range(0, len(paths), TG_ALBUM_LIMIT):
             chunk = paths[chunk_start:chunk_start + TG_ALBUM_LIMIT]
             handles = [open(p, "rb") for p in chunk]
-            media = [InputMediaPhoto(media=h) for h in handles]
-            if album_caption:
-                media[0].caption = album_caption
+            # PTB v22: InputMediaPhoto is immutable — caption must go in the constructor.
+            media = [
+                InputMediaPhoto(media=h, caption=(album_caption if i == 0 else None))
+                for i, h in enumerate(handles)
+            ]
             try:
                 await ctx.bot.send_media_group(chat_id, media)
             finally:
