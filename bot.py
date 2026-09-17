@@ -244,6 +244,13 @@ def x_tweet_caption(tweet_id: str) -> str:
     return (tweet.get("text") or "").strip()
 
 
+AUTHOR_LINE_TMPL = "📬 @twitteology┆ '{name}'"
+
+def author_line(name: str) -> str:
+    """Signature author line appended below captions (handle/emoji constant)."""
+    return AUTHOR_LINE_TMPL.format(name=name.strip()) if name and name.strip() else ""
+
+
 def x_tweet_author(tweet_id: str) -> str:
     """Author display name of an X post via fxtwitter (no @handle). '' on failure."""
     data = fetch_x_tweet(tweet_id)
@@ -595,8 +602,9 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
     if info_cap:
         lines.append(info_cap[:500])
-    if info_author:
-        lines.append(info_author)
+    sig = author_line(info_author)
+    if sig:
+        lines.append(sig)
     await info.edit_text("\n".join(lines) if lines else "ℹ️ اطلاعات افزوده‌ای برای این پست پیدا نشد.")
     await ask_quality(update, url, user_caption=text)
 
@@ -798,7 +806,7 @@ async def do_x_video_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_
         if own:
             caption = own
         else:
-            parts = [p for p in (post_text, author) if p]
+            parts = [p for p in (post_text, author_line(author)) if p]
             caption = "\n".join(parts)[:1024] or "🐦 ویدیوی X"
         with open(path, "rb") as fh:
             await update.effective_chat.send_video(
