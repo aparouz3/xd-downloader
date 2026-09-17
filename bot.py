@@ -1142,7 +1142,13 @@ def main():
         )
     )
     log.info(f"XD bot polling started (owner={ALLOWED_USER_ID})")
-    app.run_polling(drop_pending_updates=True)
+    # Explicit allowed_updates: an earlier bare getUpdates() can otherwise leave
+    # the bot's subscription stuck to a partial set (e.g. channel_post only),
+    # silently dropping normal messages.
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "edited_message", "callback_query",
+                         "channel_post", "edited_channel_post"])
 
 
 if __name__ == "__main__":
