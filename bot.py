@@ -245,14 +245,10 @@ def x_tweet_caption(tweet_id: str) -> str:
 
 
 def x_tweet_author(tweet_id: str) -> str:
-    """Author display name (@screen_name) of an X post via fxtwitter. '' on failure."""
+    """Author display name of an X post via fxtwitter (no @handle). '' on failure."""
     data = fetch_x_tweet(tweet_id)
     author = ((data or {}).get("tweet") or {}).get("author") or {}
-    name = (author.get("name") or "").strip()
-    screen = (author.get("screen_name") or "").strip()
-    if name and screen:
-        return f"{name} (@{screen})"
-    return name or (f"@{screen}" if screen else "")
+    return (author.get("name") or "").strip()
 
 
 def download_x_video(tweet_id: str, max_height: int | None = None) -> tuple[str | None, str | None]:
@@ -597,11 +593,11 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         info_cap, info_author = await asyncio.to_thread(fetch_post_meta, url)
     lines = []
-    if info_author:
-        lines.append(f"👤 {info_author}")
     if info_cap:
-        lines.append(f"📝 {info_cap[:500]}")
-    await info.edit_text("\n\n".join(lines) if lines else "ℹ️ اطلاعات افزوده‌ای برای این پست پیدا نشد.")
+        lines.append(info_cap[:500])
+    if info_author:
+        lines.append(info_author)
+    await info.edit_text("\n".join(lines) if lines else "ℹ️ اطلاعات افزوده‌ای برای این پست پیدا نشد.")
     await ask_quality(update, url, user_caption=text)
 
 
@@ -802,7 +798,7 @@ async def do_x_video_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_
         if own:
             caption = own
         else:
-            parts = [p for p in ((f"👤 {author}" if author else ""), post_text) if p]
+            parts = [p for p in (post_text, author) if p]
             caption = "\n".join(parts)[:1024] or "🐦 ویدیوی X"
         with open(path, "rb") as fh:
             await update.effective_chat.send_video(
