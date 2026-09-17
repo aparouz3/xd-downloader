@@ -30,7 +30,8 @@ import time
 import urllib.request
 import urllib.parse
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
+                    InputMediaPhoto, KeyboardButton, ReplyKeyboardMarkup)
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -74,6 +75,21 @@ BROWSER_UA = (
 )
 ACTIVE = set()               # chat ids currently downloading
 PENDING_URL = {}             # chat_id -> {"url", "msg_id", "user_caption"} awaiting quality choice
+# Download mode per chat: "quick" (auto 720p, caption, no questions) or
+# "pro" (send caption + author, then ask quality). Default = pro (old behavior).
+MODES = {}
+MODE_QUICK = "⚡ سریع"
+MODE_PRO = "🎬 حرفه‌ای"
+QUICK_QUALITY = "720p"
+
+def mode_kb(chat_id):
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(MODE_QUICK), KeyboardButton(MODE_PRO)]],
+        resize_keyboard=True, one_time_keyboard=False,
+        selective=True, input_field_placeholder="لینک بفرستید…")
+
+def mode_of(chat_id):
+    return MODES.get(chat_id, "pro")
 
 # Quality presets: label -> yt-dlp -f selector (height caps keep under 50MB)
 QUALITIES = {
@@ -128,9 +144,8 @@ def run_ytdlp(url: str, quality: str, audio_only: bool) -> tuple[str | None, str
     return path, None, fetch_post_caption(url)
 
 
-def fetch_post_caption(url: str) -> str:
-    """Post caption (description, else title) via yt-dlp metadata-only call.
-    Returns '' on any failure — caption is best-effort, never blocks delivery."""
+def fetch_post_meta(url: str) -> tuple[str, str]:
+    """(caption, uploader) via yt-dlp metadata-only call. Best-effort: '' on failure."""
     cmd = [YTDLP, "--no-playlist", "--no-warnings", "--skip-download",
            "--socket-timeout", "30", "-j", url]
     cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
@@ -139,12 +154,18 @@ def fetch_post_caption(url: str) -> str:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         if r.returncode != 0:
-            return ""
+            return "", ""
         info = json.loads(r.stdout.strip().splitlines()[-1])
         text = (info.get("description") or "").strip() or (info.get("title") or "").strip()
-        return sanitize_caption(text)
+        author = (info.get("uploader") or info.get("channel") or info.get("creator") or "").strip()
+        return sanitize_caption(text), sanitize_caption(author)
     except Exception:
-        return ""
+        return "", ""
+
+
+def fetch_post_caption(url: str) -> str:
+    """Post caption only — see fetch_post_meta."""
+    return fetch_post_meta(url)[0]
 
 
 # ── X/Twitter multi-photo support (fxtwitter API, no auth) ─────────────
@@ -223,11 +244,27 @@ def x_tweet_caption(tweet_id: str) -> str:
     return (tweet.get("text") or "").strip()
 
 
-def download_x_video(tweet_id: str) -> tuple[str | None, str | None]:
-    """Download an X post video directly from twimg (no auth). Returns (path, error)."""
+def x_tweet_author(tweet_id: str) -> str:
+    """Author display name (@screen_name) of an X post via fxtwitter. '' on failure."""
+    data = fetch_x_tweet(tweet_id)
+    author = ((data or {}).get("tweet") or {}).get("author") or {}
+    name = (author.get("name") or "").strip()
+    screen = (author.get("screen_name") or "").strip()
+    if name and screen:
+        return f"{name} (@{screen})"
+    return name or (f"@{screen}" if screen else "")
+
+
+def download_x_video(tweet_id: str, max_height: int | None = None) -> tuple[str | None, str | None]:
+    """Download an X post video directly from twimg (no auth). Returns (path, error).
+    max_height: if set, prefer variants at/below this height before the size-fit pick."""
     variants = x_video_variants(tweet_id)
     if not variants:
         return None, "ویدیویی برای این پست پیدا نکردم (خصوصی/حذف‌شده یا API در دسترس نیست)."
+    if max_height:
+        capped = [v for v in variants if (v.get("height") or 0) <= max_height]
+        if capped:
+            variants = capped
     variant = _pick_x_video_variant(variants)
     if not variant:
         return None, "ویدیویی برای این پست پیدا نکردم (خصوصی/حذف‌شده یا API در دسترس نیست)."
@@ -449,12 +486,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔒 فقط مالک می‌تونه استفاده کنه.")
         return
     await update.message.reply_text(
-        "🎬 لینک بفرست، کیفیت رو انتخاب کن، ویدیو تحویل بگیر\n\n"
+        "🎬 لینک بفرست، ویدیو تحویل بگیر\n\n"
+        "• ⚡ سریع: دانلود خودکار با کیفیت خوب (۷۲۰p) + کپشن — بدون سوال\n"
+        "• 🎬 حرفه‌ای: اول کپشن و نام author پست، بعد انتخاب کیفیت\n"
+        "• با دکمه‌های پایین می‌تونی حالت رو عوض کنی\n"
         "• یوتیوب / X / اینستاگرام / تیک‌تاک / ردیت و ۱۰۰۰+ سایت دیگه\n"
         "• پست‌های چندعکسی X → همهٔ عکسها یه‌جا میاد (بدون انتخاب کیفیت)\n"
         "• /mp3 قبل از لینک = فقط صدا (بدون انتخاب کیفیت)\n"
         "• /dp username یا لینک پروفایل اینستاگرام = عکس پروفایل\n"
-        "• سقف تلگرام: ~۵۰MB — کیفیت‌های بالاتر ممکنه جا نشه"
+        "• سقف تلگرام: ~۵۰MB — کیفیت‌های بالاتر ممکنه جا نشه",
+        reply_markup=mode_kb(update.effective_chat.id),
     )
 
 
@@ -482,11 +523,13 @@ def user_note(text: str | None) -> str:
     return sanitize_caption(stripped)
 
 
-async def ask_quality(update: Update, url: str, user_caption: str = ""):
+async def ask_quality(update: Update, url: str, user_caption: str = "",
+                      kind: str = "ytdlp", tweet_id: str = ""):
     """Show inline keyboard with quality choices, store pending URL + caption."""
     msg = await update.message.reply_text("📥 لینک دریافت شد. کیفیت مورد نظر؟")
     PENDING_URL[update.effective_chat.id] = {
         "url": url, "msg_id": msg.message_id, "user_caption": user_caption,
+        "kind": kind, "tweet_id": tweet_id,
     }
     kb = [
         [
@@ -497,6 +540,20 @@ async def ask_quality(update: Update, url: str, user_caption: str = ""):
         ]
     ]
     await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def on_mode_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Reply-keyboard press of ⚡ سریع / 🎬 حرفه‌ای — sticky per-chat mode switch."""
+    if not is_owner(update):
+        return
+    chat_id = update.effective_chat.id
+    MODES[chat_id] = "quick" if (update.message.text or "").strip() == MODE_QUICK else "pro"
+    await update.message.reply_text(
+        f"✅ حالت: {MODE_QUICK if MODES[chat_id] == 'quick' else MODE_PRO} — "
+        + ("هر لینک، خودکار با کیفیت خوب (۷۲۰p) + کپشن دانلود میشه."
+           if MODES[chat_id] == "quick"
+           else "اول کپشن و نام author، بعد انتخاب کیفیت."),
+        reply_markup=mode_kb(chat_id))
 
 
 async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -524,6 +581,27 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await do_x_photos(update, ctx, xm.group(1), user_caption=text)
         return
 
+    mode = mode_of(update.effective_chat.id)
+    if mode == "quick":
+        # ⚡ quick: auto-download at good quality, caption attached, no questions.
+        await do_download(update, ctx, url, quality=QUICK_QUALITY, user_caption=text)
+        return
+
+    # 🎬 pro: show caption + author first, then ask quality.
+    info = await update.message.reply_text("🔎 در حال گرفتن اطلاعات پست...")
+    xm2 = X_URL_RE.search(url)
+    if xm2:
+        tid = xm2.group(1)
+        info_cap = await asyncio.to_thread(x_tweet_caption, tid)
+        info_author = await asyncio.to_thread(x_tweet_author, tid)
+    else:
+        info_cap, info_author = await asyncio.to_thread(fetch_post_meta, url)
+    lines = []
+    if info_author:
+        lines.append(f"👤 {info_author}")
+    if info_cap:
+        lines.append(f"📝 {info_cap[:500]}")
+    await info.edit_text("\n\n".join(lines) if lines else "ℹ️ اطلاعات افزوده‌ای برای این پست پیدا نشد.")
     await ask_quality(update, url, user_caption=text)
 
 
@@ -605,9 +683,14 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
     try:
         wait_msg = await update.message.reply_text("🐦 در حال بررسی پست X...")
         photos, videos = await asyncio.to_thread(x_media_urls, tweet_id)
+        if not photos and videos and mode_of(chat_id) == "pro":
+            # Pro mode: don't auto-pick — ask quality first (variants are height-capped).
+            await wait_msg.delete()
+            await ask_quality(update, f"x:{tweet_id}", user_caption=user_caption,
+                              kind="xvideo", tweet_id=tweet_id)
+            return
         if not photos and videos:
-            # Video post (dead end before: quality picker never reached X links) →
-            # download the video directly from twimg via fxtwitter variants.
+            # Quick mode / fallback: download the best size-fitting variant from twimg.
             await wait_msg.edit_text("🎬 ویدیوی X — ⏳ در حال دانلود...")
             path, err = await asyncio.to_thread(download_x_video, tweet_id)
             if err or not path:
@@ -686,6 +769,63 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
         ACTIVE.discard(chat_id)
 
 
+async def do_x_video_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: str,
+                          quality: str, edit_msg_id: int | None = None,
+                          user_caption: str = ""):
+    """Pro-mode X video after quality choice: capped download, caption + author."""
+    chat_id = update.effective_chat.id
+    ACTIVE.add(chat_id)
+    wait_msg = None
+    path = None
+    try:
+        cap_height = {"480p": 480, "720p": 720, "1080p": 1080}.get(quality)
+        label = f"🎬 X — {quality}"
+        if edit_msg_id:
+            wait_msg = await ctx.bot.edit_message_text(
+                f"{label} — ⏳ در حال دانلود...", chat_id, edit_msg_id)
+        else:
+            wait_msg = await update.message.reply_text(f"{label} — ⏳ در حال دانلود...")
+        await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+        path, err = await asyncio.to_thread(download_x_video, tweet_id, cap_height)
+        if err:
+            await wait_msg.edit_text(f"❌ {err}")
+            return
+        size = os.path.getsize(path)
+        if size > DOC_LIMIT:
+            await wait_msg.edit_text(
+                f"❌ فایل {size // (1024*1024)}MB است — کیفیت پایین‌تر رو انتخاب کن.")
+            os.remove(path); path = None
+            return
+        post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
+        author = sanitize_caption(await asyncio.to_thread(x_tweet_author, tweet_id))
+        own = user_note(user_caption)
+        if own:
+            caption = own
+        else:
+            parts = [p for p in ((f"👤 {author}" if author else ""), post_text) if p]
+            caption = "\n".join(parts)[:1024] or "🐦 ویدیوی X"
+        with open(path, "rb") as fh:
+            await update.effective_chat.send_video(
+                video=fh, caption=caption, supports_streaming=True)
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+        os.remove(path); path = None
+    except Exception as e:
+        log.exception("x video pick failed")
+        try:
+            if wait_msg:
+                await wait_msg.edit_text(f"❌ خطا: {str(e)[:200]}")
+        except Exception:
+            pass
+    finally:
+        if path and os.path.isfile(path):
+            try: os.remove(path)
+            except Exception: pass
+        ACTIVE.discard(chat_id)
+
+
 async def on_mp3(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
@@ -710,6 +850,12 @@ async def on_quality_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     quality = {"480": "480p", "720": "720p", "1080": "1080p", "best": "Best"}.get(
         q.data.split(":")[1], "720p"
     )
+    if pending.get("kind") == "xvideo":
+        # X video: pick twimg variant capped at chosen height, send with caption (+author in pro).
+        await do_x_video_pick(update, ctx, pending["tweet_id"], quality,
+                              edit_msg_id=pending["msg_id"],
+                              user_caption=pending.get("user_caption", ""))
+        return
     await do_download(update, ctx, pending["url"], quality=quality, edit_msg_id=pending["msg_id"],
                       user_caption=pending.get("user_caption", ""))
 
@@ -779,6 +925,14 @@ def main():
     app.add_handler(CommandHandler("mp3", on_mp3))
     app.add_handler(CommandHandler("dp", on_dp))
     app.add_handler(CallbackQueryHandler(on_quality_pick, pattern=r"^q:"))
+    # Reply-keyboard mode buttons (plain text, no URL) — before the link handler.
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND
+            & filters.Regex(rf"^\s*({re.escape(MODE_QUICK)}|{re.escape(MODE_PRO)})\s*$"),
+            on_mode_button,
+        )
+    )
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND
