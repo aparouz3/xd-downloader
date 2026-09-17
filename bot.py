@@ -102,15 +102,36 @@ def share_kb(key: str) -> InlineKeyboardMarkup:
         [[InlineKeyboardButton("📤 ارسال به کانال", callback_data=f"share:{key}")]])
 
 
+def _share_payload(msgs) -> list[dict]:
+    """Snapshot sent messages so the channel re-post needs no later fetching:
+    file_id (media) or plain text + caption — identical rendering, zero re-download."""
+    out = []
+    for m in msgs:
+        if m.video:
+            out.append({"kind": "video", "file_id": m.video.file_id,
+                        "caption": m.caption, "supports_streaming": m.video.supports_streaming})
+        elif m.photo:
+            out.append({"kind": "photo", "file_id": m.photo[-1].file_id, "caption": m.caption})
+        elif m.audio:
+            out.append({"kind": "audio", "file_id": m.audio.file_id,
+                        "caption": m.caption or m.audio.title})
+        elif m.document:
+            out.append({"kind": "document", "file_id": m.document.file_id, "caption": m.caption})
+        else:
+            out.append({"kind": "text", "text": m.text or m.caption or ""})
+    return out
+
+
 async def add_share(update, sent, kind: str) -> InlineKeyboardMarkup | None:
-    """Pro mode only: register 'sent' message(s) for channel forwarding and
-    return the share-button keyboard (None in quick mode)."""
-    if kind == "album":
-        ids = [m.message_id for m in (sent if isinstance(sent, (list, tuple)) else [sent])]
-    else:
-        ids = [sent.message_id]
+    """Pro mode only: snapshot 'sent' message(s) for a native channel re-post
+    and return the share-button keyboard (None in quick mode)."""
+    if not isinstance(sent, (list, tuple)):
+        sent = [sent]
     key = str(next(_share_seq))
-    SHARES[key] = {"chat_id": update.effective_chat.id, "message_ids": ids, "kind": kind}
+    SHARES[key] = {"chat_id": update.effective_chat.id,
+                   "message_ids": [m.message_id for m in sent],
+                   "album": kind == "album", "multi_text": kind == "thread",
+                   "payload": _share_payload(sent)}
     return share_kb(key)
 
 # Quality presets: label -> yt-dlp -f selector (height caps keep under 50MB)
@@ -612,7 +633,9 @@ async def on_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer("دکمه فقط همون چت خودش کار می‌کنه.", show_alert=True)
         return
     try:
-        await ctx.bot.forward_messages(SHARE_CHANNEL, rec["chat_id"], rec["message_ids"])
+        # Native re-post from the stored snapshot (file_id reuse — instant, no
+        # re-download, and no "Forwarded from"/bot-name trace in the channel).
+        await repost_to_channel(ctx.bot, rec)
     except Exception as e:
         await update.callback_query.answer(f"❌ ارسال به کانال نشد: {str(e)[:80]}", show_alert=True)
         return
@@ -623,6 +646,38 @@ async def on_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             chat_id=rec["chat_id"], message_id=rec["message_ids"][-1], reply_markup=None)
     except Exception:
         pass
+
+
+async def repost_to_channel(bot_obj, rec: dict) -> None:
+    """Re-post the snapshotted payload into the channel natively (file_id reuse).
+
+    Media/album/thread-text each re-created, NOT forwarded: no "Forwarded from"
+    header and no bot signature — the channel posts as itself."""
+    payload = rec["payload"]
+    if rec.get("album") and len(payload) > 1:
+        media = []
+        for i, it in enumerate(payload):
+            media.append(InputMediaPhoto(media=it["file_id"],
+                                         caption=it.get("caption") if i == 0 else None))
+        await bot_obj.send_media_group(SHARE_CHANNEL, media)
+        return
+    if rec.get("multi_text"):
+        for it in payload:
+            await bot_obj.send_message(SHARE_CHANNEL, text=it["text"])
+        return
+    it = payload[0]
+    k = it["kind"]
+    if k == "video":
+        await bot_obj.send_video(SHARE_CHANNEL, video=it["file_id"], caption=it.get("caption"),
+                                 supports_streaming=it.get("supports_streaming", True))
+    elif k == "photo":
+        await bot_obj.send_photo(SHARE_CHANNEL, photo=it["file_id"], caption=it.get("caption"))
+    elif k == "audio":
+        await bot_obj.send_audio(SHARE_CHANNEL, audio=it["file_id"], caption=it.get("caption"))
+    elif k == "document":
+        await bot_obj.send_document(SHARE_CHANNEL, document=it["file_id"], caption=it.get("caption"))
+    else:
+        await bot_obj.send_message(SHARE_CHANNEL, text=it.get("text") or "")
 
 
 async def on_mode_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -831,13 +886,13 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
                 if own:
                     parts[0] = own + "\n\n" + parts[0]
                 await wait_msg.delete()
-                last = None
+                sent_msgs = []
                 for piece in parts:
-                    last = await update.effective_chat.send_message(piece)
-                if last is not None and mode_of(chat_id) == "pro":
+                    sent_msgs.append(await update.effective_chat.send_message(piece))
+                if mode_of(chat_id) == "pro":
                     try:
-                        await last.edit_reply_markup(
-                            reply_markup=await add_share(update, last, "text"))
+                        await sent_msgs[-1].edit_reply_markup(
+                            reply_markup=await add_share(update, sent_msgs, "thread"))
                     except Exception:
                         log.exception("share kb attach failed")
                 return
