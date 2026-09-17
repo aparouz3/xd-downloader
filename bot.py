@@ -244,7 +244,7 @@ def x_tweet_caption(tweet_id: str) -> str:
     return (tweet.get("text") or "").strip()
 
 
-AUTHOR_LINE_TMPL = "📬 @twitteology┆ '{name}'"
+AUTHOR_LINE_TMPL = "📬 @twitteology┆ {name}"
 
 def author_line(name: str) -> str:
     """Signature author line appended below captions (handle/emoji constant)."""
@@ -721,10 +721,16 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             os.remove(path)
             return
         if not photos:
-            hint = (
-                "این پست ویدیو یا عکسی نداره (پست خصوصی/حذف‌شده یا API در دسترس نیست)."
-            )
-            await wait_msg.edit_text(f"❌ {hint}")
+            # Text-only post (or private/deleted): deliver the post text + signature line.
+            post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
+            author = await asyncio.to_thread(x_tweet_author, tweet_id)
+            if post_text:
+                own = user_note(user_caption)
+                lines = [p2 for p2 in (own or post_text, author_line(author)) if p2]
+                await wait_msg.edit_text("\n".join(lines))
+            else:
+                await wait_msg.edit_text(
+                    "❌ این پست ویدیو یا عکسی نداره (پست خصوصی/حذف‌شده یا API در دسترس نیست).")
             return
         total = len(photos)
         await wait_msg.edit_text(f"🐦 {total} عکس پیدا شد — ⏳ در حال دانلود...")
