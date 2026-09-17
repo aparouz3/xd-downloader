@@ -119,11 +119,8 @@ def _share_payload(msgs) -> list[dict]:
         elif m.document:
             out.append({"kind": "document", "file_id": m.document.file_id, "caption": m.caption})
         else:
-            out.append({"kind": "text", "text": _strip_sig(m.text or m.caption or "")})
-    # Channel posts must contain ONLY the post — drop our signature lines everywhere.
-    for it in out:
-        if it.get("caption"):
-            it["caption"] = _strip_sig(it["caption"]) or None
+            out.append({"kind": "text", "text": m.text or m.caption or ""})
+    # Verbatim: the pro-mode 📬 author line belongs in the channel post too.
     return out
 
 
