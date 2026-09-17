@@ -18,6 +18,7 @@ Access control: only ALLOWED_USER_ID (the owner) can use it.
 """
 
 import asyncio
+from itertools import count
 import glob
 import json
 import logging
@@ -78,6 +79,10 @@ PENDING_URL = {}             # chat_id -> {"url", "msg_id", "user_caption"} awai
 # Download mode per chat: "quick" (auto 720p, caption, no questions) or
 # "pro" (send caption + author, then ask quality). Default = pro (old behavior).
 MODES = {}
+# --- "ارسال به کانال" (share to channel) ---
+SHARE_CHANNEL = "@twitteology"
+SHARES: dict[str, dict] = {}   # key -> {chat_id, message_ids, kind}
+_share_seq = count()
 MODE_QUICK = "⚡ سریع"
 MODE_PRO = "🎬 حرفه‌ای"
 QUICK_QUALITY = "720p"
@@ -90,6 +95,23 @@ def mode_kb(chat_id):
 
 def mode_of(chat_id):
     return MODES.get(chat_id, "pro")
+
+
+def share_kb(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📤 ارسال به کانال", callback_data=f"share:{key}")]])
+
+
+async def add_share(update, sent, kind: str) -> InlineKeyboardMarkup | None:
+    """Pro mode only: register 'sent' message(s) for channel forwarding and
+    return the share-button keyboard (None in quick mode)."""
+    if kind == "album":
+        ids = [m.message_id for m in (sent if isinstance(sent, (list, tuple)) else [sent])]
+    else:
+        ids = [sent.message_id]
+    key = str(next(_share_seq))
+    SHARES[key] = {"chat_id": update.effective_chat.id, "message_ids": ids, "kind": kind}
+    return share_kb(key)
 
 # Quality presets: label -> yt-dlp -f selector (height caps keep under 50MB)
 QUALITIES = {
@@ -576,6 +598,33 @@ async def ask_quality(update: Update, url: str, user_caption: str = "",
     await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
 
 
+async def on_share(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """'ارسال به کانال' button: forward the exact stored message(s) to the channel."""
+    if not is_owner(update):
+        await update.callback_query.answer("فقط صاحب ربات می‌تونه.", show_alert=True)
+        return
+    key = update.callback_query.data.split(":", 1)[1]
+    rec = SHARES.get(key)
+    if not rec:
+        await update.callback_query.answer("این پست منقضی شده (ربات ری‌استارت شده؟).", show_alert=True)
+        return
+    if update.effective_chat.id != rec["chat_id"]:
+        await update.callback_query.answer("دکمه فقط همون چت خودش کار می‌کنه.", show_alert=True)
+        return
+    try:
+        await ctx.bot.forward_messages(SHARE_CHANNEL, rec["chat_id"], rec["message_ids"])
+    except Exception as e:
+        await update.callback_query.answer(f"❌ ارسال به کانال نشد: {str(e)[:80]}", show_alert=True)
+        return
+    SHARES.pop(key, None)
+    await update.callback_query.answer("✅ به کانال ارسال شد")
+    try:
+        await ctx.bot.edit_message_reply_markup(
+            chat_id=rec["chat_id"], message_id=rec["message_ids"][-1], reply_markup=None)
+    except Exception:
+        pass
+
+
 async def on_mode_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Reply-keyboard press of ⚡ سریع / 🎬 حرفه‌ای — sticky per-chat mode switch."""
     if not is_owner(update):
@@ -741,10 +790,16 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
                 caption = post_text
             else:
                 caption = f"🐦 ویدیوی X ({size // (1024*1024)}MB)" if size > 1024 * 1024 else "🐦 ویدیوی X"
+            sent = None
             with open(path, "rb") as fh:
-                await update.effective_chat.send_video(
+                sent = await update.effective_chat.send_video(
                     video=fh, caption=caption, supports_streaming=True
                 )
+            if mode_of(chat_id) == "pro":
+                try:
+                    await sent.edit_reply_markup(reply_markup=await add_share(update, sent, "media"))
+                except Exception:
+                    log.exception("share kb attach failed")
             try:
                 await wait_msg.delete()
             except Exception:
@@ -760,9 +815,9 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
             own = user_note(user_caption)
             if thread:
-                # Signature goes at the end of the merged thread (last chunk).
+                # Signature goes at the end of the merged thread (last chunk) — pro only.
                 body = "\n\n".join(thread)
-                sig = author_line(author)
+                sig = author_line(author) if mode_of(chat_id) == "pro" else ""
                 parts, cur = [], ""
                 for para in body.split("\n\n"):
                     add = (para + "\n\n") if cur else para + "\n\n"
@@ -776,12 +831,21 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
                 if own:
                     parts[0] = own + "\n\n" + parts[0]
                 await wait_msg.delete()
+                last = None
                 for piece in parts:
-                    await update.effective_chat.send_message(piece)
+                    last = await update.effective_chat.send_message(piece)
+                if last is not None and mode_of(chat_id) == "pro":
+                    try:
+                        await last.edit_reply_markup(
+                            reply_markup=await add_share(update, last, "text"))
+                    except Exception:
+                        log.exception("share kb attach failed")
                 return
             if post_text:
-                lines = [p2 for p2 in (own or post_text, author_line(author)) if p2]
-                await wait_msg.edit_text("\n".join(lines))
+                sig2 = author_line(author) if mode_of(chat_id) == "pro" else ""
+                await wait_msg.edit_text("\n".join(p2 for p2 in (own or post_text, sig2) if p2),
+                                         reply_markup=(await add_share(update, wait_msg, "text"))
+                                         if mode_of(chat_id) == "pro" else None)
             else:
                 await wait_msg.edit_text(
                     "❌ این پست ویدیو یا عکسی نداره (پست خصوصی/حذف‌شده یا API در دسترس نیست).")
@@ -800,6 +864,7 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
         await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
 
         # Telegram albums: max 10 items per send; send in chunks of 10.
+        group_msgs = []
         for chunk_start in range(0, len(paths), TG_ALBUM_LIMIT):
             chunk = paths[chunk_start:chunk_start + TG_ALBUM_LIMIT]
             handles = [open(p, "rb") for p in chunk]
@@ -809,10 +874,16 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
                 for i, h in enumerate(handles)
             ]
             try:
-                await ctx.bot.send_media_group(chat_id, media)
+                group_msgs.extend(await ctx.bot.send_media_group(chat_id, media))
             finally:
                 for h in handles:
                     h.close()
+        if group_msgs and mode_of(chat_id) == "pro":
+            try:
+                await group_msgs[-1].edit_reply_markup(
+                    reply_markup=await add_share(update, group_msgs, "album"))
+            except Exception:
+                log.exception("share kb attach failed")
         failed_note = f"\n⚠️ {failed} عکس دانلود نشد." if failed else ""
         try:
             await wait_msg.delete()
@@ -869,8 +940,12 @@ async def do_x_video_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_
             parts = [p for p in (post_text, author_line(author)) if p]
             caption = "\n".join(parts)[:1024] or "🐦 ویدیوی X"
         with open(path, "rb") as fh:
-            await update.effective_chat.send_video(
+            sent = await update.effective_chat.send_video(
                 video=fh, caption=caption, supports_streaming=True)
+        try:
+            await sent.edit_reply_markup(reply_markup=await add_share(update, sent, "media"))
+        except Exception:
+            log.exception("share kb attach failed")
         try:
             await wait_msg.delete()
         except Exception:
@@ -958,15 +1033,21 @@ async def do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str,
             os.remove(path)
             return
 
+        sent = None
         with open(path, "rb") as fh:
             if audio_only:
-                await update.effective_chat.send_audio(audio=fh, title=caption[:64])
+                sent = await update.effective_chat.send_audio(audio=fh, title=caption[:64])
             elif size <= TG_FILE_LIMIT:
-                await update.effective_chat.send_video(
+                sent = await update.effective_chat.send_video(
                     video=fh, caption=caption, supports_streaming=True
                 )
             else:
-                await update.effective_chat.send_document(document=fh, caption=caption)
+                sent = await update.effective_chat.send_document(document=fh, caption=caption)
+        if sent is not None and mode_of(chat_id) == "pro":
+            try:
+                await sent.edit_reply_markup(reply_markup=await add_share(update, sent, "media"))
+            except Exception:
+                log.exception("share kb attach failed")
         try:
             await wait_msg.delete()
         except Exception:
@@ -989,6 +1070,7 @@ def main():
     app.add_handler(CommandHandler("mp3", on_mp3))
     app.add_handler(CommandHandler("dp", on_dp))
     app.add_handler(CallbackQueryHandler(on_quality_pick, pattern=r"^q:"))
+    app.add_handler(CallbackQueryHandler(on_share, pattern=r"^share:"))
     # Reply-keyboard mode buttons (plain text, no URL) — before the link handler.
     app.add_handler(
         MessageHandler(
