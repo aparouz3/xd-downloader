@@ -258,6 +258,37 @@ def x_tweet_author(tweet_id: str) -> str:
     return (author.get("name") or "").strip()
 
 
+def x_thread_texts(tweet_id: str) -> list[str]:
+    """Full unrolled thread texts via threadreaderapp.com (best-effort).
+
+    Returns [] when the thread was never unrolled (site redirects to login)
+    or on any network error. Caller falls back to the single-tweet text.
+    """
+    import html as _html
+    try:
+        req = urllib.request.Request(
+            f"https://threadreaderapp.com/thread/{tweet_id}.html",
+            headers={"User-Agent": BROWSER_UA})
+        resp = urllib.request.urlopen(req, timeout=25)
+        page = resp.read().decode("utf-8", "ignore")
+        if "/authenticate" in resp.geturl():
+            return []
+        blocks = re.findall(
+            r'data-screenname="([^"]+)" data-tweet="(\d+)" dir="auto">(.*?)</div>',
+            page, re.S)
+    except Exception as e:
+        log.warning("threadreader failed for %s: %s", tweet_id, e)
+        return []
+    texts = []
+    for _sn, _tid, body in blocks:
+        b = re.sub(r"<br\s*/?>", "\n", body)
+        b = re.sub(r"<sup class=\"tw-permalink\">.*?</sup>", "", b, flags=re.S)
+        t = _html.unescape(re.sub(r"<[^>]+>", "", b)).strip()
+        if t:
+            texts.append(t)
+    return texts
+
+
 def download_x_video(tweet_id: str, max_height: int | None = None) -> tuple[str | None, str | None]:
     """Download an X post video directly from twimg (no auth). Returns (path, error).
     max_height: if set, prefer variants at/below this height before the size-fit pick."""
@@ -722,10 +753,33 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             return
         if not photos:
             # Text-only post (or private/deleted): deliver the post text + signature line.
-            post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
+            # If it's a continuation thread (author's self-replies), try to merge all
+            # discrete tweets into one text via threadreaderapp.
             author = await asyncio.to_thread(x_tweet_author, tweet_id)
+            thread = await asyncio.to_thread(x_thread_texts, tweet_id)
+            post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
+            own = user_note(user_caption)
+            if thread:
+                # Signature goes at the end of the merged thread (last chunk).
+                body = "\n\n".join(thread)
+                sig = author_line(author)
+                parts, cur = [], ""
+                for para in body.split("\n\n"):
+                    add = (para + "\n\n") if cur else para + "\n\n"
+                    if len(cur) + len(add) > 4000 - len(sig):
+                        parts.append(cur.strip())
+                        cur = para + "\n\n"
+                    else:
+                        cur += add
+                cur = (cur.strip() + ("\n" + sig if sig else "")).strip()
+                parts.append(cur)
+                if own:
+                    parts[0] = own + "\n\n" + parts[0]
+                await wait_msg.delete()
+                for piece in parts:
+                    await update.effective_chat.send_message(piece)
+                return
             if post_text:
-                own = user_note(user_caption)
                 lines = [p2 for p2 in (own or post_text, author_line(author)) if p2]
                 await wait_msg.edit_text("\n".join(lines))
             else:
