@@ -1035,10 +1035,13 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
                 # Edit FIRST (updates wait_msg), then snapshot for share —
                 # evaluating add_share inside the edit_text() args would capture
                 # the pre-edit placeholder text instead of the post itself.
-                await wait_msg.edit_text("\n".join(p2 for p2 in (own or post_text, sig2) if p2))
+                # edit_text returns the UPDATED Message object (the old variable
+                # keeps the placeholder text) — must rebind before snapshotting.
+                wait_msg = await wait_msg.edit_text(
+                    "\n".join(p2 for p2 in (own or post_text, sig2) if p2))
                 if mode_of(chat_id) == "pro":
-                    await wait_msg.edit_reply_markup(
-                        reply_markup=await add_share(update, wait_msg, "text"))
+                    kb = await add_share(update, wait_msg, "text")
+                    wait_msg = await wait_msg.edit_reply_markup(reply_markup=kb)
             else:
                 await wait_msg.edit_text(
                     "❌ این پست ویدیو یا عکسی نداره (پست خصوصی/حذف‌شده یا API در دسترس نیست).")
