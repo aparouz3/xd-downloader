@@ -32,7 +32,8 @@ import urllib.request
 import urllib.parse
 
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                    InputMediaPhoto, KeyboardButton, ReplyKeyboardMarkup)
+                    InputMediaPhoto, InputMediaVideo, InputMediaAudio,
+                    InputMediaDocument, KeyboardButton, ReplyKeyboardMarkup)
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -128,6 +129,8 @@ async def add_share(update, sent, kind: str) -> InlineKeyboardMarkup | None:
     if not isinstance(sent, (list, tuple)):
         sent = [sent]
     key = str(next(_share_seq))
+    while len(SHARES) > 200:
+        SHARES.pop(next(iter(SHARES)))
     SHARES[key] = {"chat_id": update.effective_chat.id,
                    "message_ids": [m.message_id for m in sent],
                    "album": kind == "album", "multi_text": kind == "thread",
@@ -694,8 +697,135 @@ async def on_mode_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=mode_kb(chat_id))
 
 
+FWD_NOTE = "↩️ برای انتشار در کانال، یک «/» اول متن بفرست."
+
+
+def _strip_sig(text: str) -> str:
+    """Remove our bot's channel signature lines so re-posts stay clean."""
+    lines = [l for l in (text or "").splitlines()
+             if "@twitteology" not in l and "📬" not in l]
+    return "\n".join(lines).strip()
+
+
+FWD_BUF: dict[str, list] = {}      # media_group_id -> [Message, ...]
+FWD_TASKS: dict[str, object] = {}  # media_group_id -> asyncio flush task
+
+
+def _media_item(cm):
+    """InputMedia item for a forwarded photo/video/document (file_id reuse)."""
+    if cm.photo:
+        return InputMediaPhoto(media=cm.photo[-1].file_id, caption=cm.caption)
+    if cm.video:
+        return InputMediaVideo(media=cm.video.file_id, caption=cm.caption,
+                               supports_streaming=True)
+    if cm.document:
+        return InputMediaDocument(media=cm.document.file_id, caption=cm.caption)
+    if cm.audio:
+        return InputMediaAudio(media=cm.audio.file_id, caption=cm.caption)
+    return None
+
+
+async def _flush_fwd_group(ctx, mgid: str, chat_id: int):
+    """Publish a buffered forwarded album as ONE native channel album."""
+    msgs = sorted(FWD_BUF.pop(mgid, []), key=lambda m: m.message_id)
+    FWD_TASKS.pop(mgid, None)
+    if not msgs:
+        return
+    try:
+        media = []
+        for cm in msgs:
+            it = _media_item(cm)
+            if it is None:
+                continue
+            if media:
+                it = type(it)(media=it.media)  # caption only on the first item
+            media.append(it)
+        # captions: cleaned of our signature line
+        if media and msgs[0].caption:
+            cap = _strip_sig(msgs[0].caption)
+            media[0] = type(media[0])(media=media[0].media, caption=cap or None)
+        if len(media) > 1:
+            await ctx.bot.send_media_group(SHARE_CHANNEL, media)
+        elif len(media) == 1:
+            it = media[0]
+            k = type(it).__name__
+            if k == "InputMediaPhoto":
+                await ctx.bot.send_photo(SHARE_CHANNEL, photo=it.media, caption=it.caption)
+            elif k == "InputMediaVideo":
+                await ctx.bot.send_video(SHARE_CHANNEL, video=it.media,
+                                         caption=it.caption, supports_streaming=True)
+            elif k == "InputMediaAudio":
+                await ctx.bot.send_audio(SHARE_CHANNEL, audio=it.media, caption=it.caption)
+            else:
+                await ctx.bot.send_document(SHARE_CHANNEL, document=it.media,
+                                            caption=it.caption)
+        await ctx.bot.send_message(chat_id, "✅ منتشر شد")
+    except Exception:
+        log.exception("fwd album flush failed")
+        try:
+            await ctx.bot.send_message(chat_id, "❌ انتشار آلبوم شکست خورد")
+        except Exception:
+            pass
+
+
+async def on_channel_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner forwards a post (channel/elsewhere) into the bot DM → publish it
+    into SHARE_CHANNEL natively: no 'Forwarded from' header, no bot name."""
+    if not is_owner(update):
+        return
+    m = update.message
+    if getattr(m, "forward_origin", None) is None:
+        return
+    chat_id = update.effective_chat.id
+    # Album: Telegram delivers items as separate updates — buffer, flush after 2s.
+    if m.media_group_id:
+        FWD_BUF.setdefault(m.media_group_id, []).append(m)
+        if m.media_group_id not in FWD_TASKS:
+            FWD_TASKS[m.media_group_id] = asyncio.get_running_loop().call_later(
+                2.0, lambda: asyncio.ensure_future(
+                    _flush_fwd_group(ctx, m.media_group_id, chat_id)))
+        return
+    media = _media_item(m)
+    try:
+        if media is not None:
+            if isinstance(media, InputMediaPhoto):
+                await ctx.bot.send_photo(SHARE_CHANNEL, photo=media.media,
+                                         caption=_strip_sig(m.caption or "") or None)
+            elif isinstance(media, InputMediaVideo):
+                await ctx.bot.send_video(SHARE_CHANNEL, video=media.media,
+                                         caption=_strip_sig(m.caption or "") or None,
+                                         supports_streaming=True)
+            elif isinstance(media, InputMediaAudio):
+                await ctx.bot.send_audio(SHARE_CHANNEL, audio=media.media,
+                                         caption=_strip_sig(m.caption or "") or None)
+            else:
+                await ctx.bot.send_document(SHARE_CHANNEL, document=media.media,
+                                            caption=_strip_sig(m.caption or "") or None)
+            await m.reply_text("✅ منتشر شد")
+            return
+        txt = _strip_sig(m.text or "")
+        if not txt:
+            await m.reply_text("❌ متنی برای انتشار پیدا نشد.")
+        elif txt.startswith("/"):
+            # escape hatch: "/..." prefix publishes the text VERBATIM
+            await ctx.bot.send_message(SHARE_CHANNEL, text=txt.lstrip("/").lstrip())
+            await m.reply_text("✅ منتشر شد")
+        else:
+            await m.reply_text(FWD_NOTE)
+    except Exception as e:
+        log.exception("channel forward publish failed")
+        try:
+            await m.reply_text(f"❌ انتشار در کانال شکست خورد: {str(e)[:120]}")
+        except Exception:
+            pass
+
+
 async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
+        return
+    if getattr(update.message, "forward_origin", None) is not None:
+        # forwarded post → publish flow, not a download link
+        await on_channel_forward(update, ctx)
         return
     text = update.message.text or ""
     url = extract_url(text)
@@ -898,9 +1028,13 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
                 return
             if post_text:
                 sig2 = author_line(author) if mode_of(chat_id) == "pro" else ""
-                await wait_msg.edit_text("\n".join(p2 for p2 in (own or post_text, sig2) if p2),
-                                         reply_markup=(await add_share(update, wait_msg, "text"))
-                                         if mode_of(chat_id) == "pro" else None)
+                # Edit FIRST (updates wait_msg), then snapshot for share —
+                # evaluating add_share inside the edit_text() args would capture
+                # the pre-edit placeholder text instead of the post itself.
+                await wait_msg.edit_text("\n".join(p2 for p2 in (own or post_text, sig2) if p2))
+                if mode_of(chat_id) == "pro":
+                    await wait_msg.edit_reply_markup(
+                        reply_markup=await add_share(update, wait_msg, "text"))
             else:
                 await wait_msg.edit_text(
                     "❌ این پست ویدیو یا عکسی نداره (پست خصوصی/حذف‌شده یا API در دسترس نیست).")
@@ -1134,6 +1268,8 @@ def main():
             on_mode_button,
         )
     )
+    # Forwarded channel posts (text or media) → republish into the channel.
+    app.add_handler(MessageHandler(filters.ALL, on_channel_forward))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND
@@ -1143,12 +1279,12 @@ def main():
     )
     log.info(f"XD bot polling started (owner={ALLOWED_USER_ID})")
     # Explicit allowed_updates: an earlier bare getUpdates() can otherwise leave
-    # the bot's subscription stuck to a partial set (e.g. channel_post only),
-    # silently dropping normal messages.
+    # the bot's subscription stuck to a partial set, silently dropping messages.
+    # NOTE: channel_post deliberately EXCLUDED — receiving it makes the bot treat
+    # its own/echoed channel posts as user links ("در حال بررسی…" spam in channel).
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "edited_message", "callback_query",
-                         "channel_post", "edited_channel_post"])
+        allowed_updates=["message", "edited_message", "callback_query"])
 
 
 if __name__ == "__main__":
