@@ -777,6 +777,10 @@ async def on_channel_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if getattr(m, "forward_origin", None) is None:
         return
     chat_id = update.effective_chat.id
+    # Forwarded TEXT containing a link = old workflow: download that link instead.
+    if (m.text and not _media_item(m)) and extract_url(m.text):
+        await on_link(update, ctx)
+        return
     # Album: Telegram delivers items as separate updates — buffer, flush after 2s.
     if m.media_group_id:
         FWD_BUF.setdefault(m.media_group_id, []).append(m)
@@ -822,10 +826,6 @@ async def on_channel_forward(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
-        return
-    if getattr(update.message, "forward_origin", None) is not None:
-        # forwarded post → publish flow, not a download link
-        await on_channel_forward(update, ctx)
         return
     text = update.message.text or ""
     url = extract_url(text)
@@ -1268,8 +1268,9 @@ def main():
             on_mode_button,
         )
     )
-    # Forwarded channel posts (text or media) → republish into the channel.
-    app.add_handler(MessageHandler(filters.ALL, on_channel_forward))
+    # Forwarded posts (text or media) → republish into the channel.
+    # filters.FORWARDED only: a catch-all would swallow plain link messages.
+    app.add_handler(MessageHandler(filters.FORWARDED, on_channel_forward))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND
