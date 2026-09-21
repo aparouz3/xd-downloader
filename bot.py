@@ -942,6 +942,34 @@ async def on_dp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await do_ig_profile(update, ctx, username)
 
 
+async def send_x_thread_text(update: Update, chat_id: int, body: str,
+                             own: str, author: str) -> list:
+    """Split [body] into ≤4000-char Telegram messages (pro signature at the end),
+    prepend [own] to the first chunk, and send them. Returns the sent messages.
+
+    Shared by the text-only X path and the photo X path so an author's
+    continuation captions (written as self-replies/comments) are delivered the
+    same way whether the tweet has media or not.
+    """
+    sig = author_line(author) if mode_of(chat_id) == "pro" else ""
+    parts, cur = [], ""
+    for para in body.split("\n\n"):
+        add = (para + "\n\n") if cur else para + "\n\n"
+        if len(cur) + len(add) > 4000 - len(sig):
+            parts.append(cur.strip())
+            cur = para + "\n\n"
+        else:
+            cur += add
+    cur = (cur.strip() + ("\n" + sig if sig else "")).strip()
+    parts.append(cur)
+    if own:
+        parts[0] = own + "\n\n" + parts[0]
+    sent = []
+    for piece in parts:
+        sent.append(await update.effective_chat.send_message(piece))
+    return sent
+
+
 async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: str,
                       user_caption: str = ""):
     """Fetch all photos of an X post and send them as one media group.
@@ -1003,23 +1031,8 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             if thread:
                 # Signature goes at the end of the merged thread (last chunk) — pro only.
                 body = "\n\n".join(thread)
-                sig = author_line(author) if mode_of(chat_id) == "pro" else ""
-                parts, cur = [], ""
-                for para in body.split("\n\n"):
-                    add = (para + "\n\n") if cur else para + "\n\n"
-                    if len(cur) + len(add) > 4000 - len(sig):
-                        parts.append(cur.strip())
-                        cur = para + "\n\n"
-                    else:
-                        cur += add
-                cur = (cur.strip() + ("\n" + sig if sig else "")).strip()
-                parts.append(cur)
-                if own:
-                    parts[0] = own + "\n\n" + parts[0]
                 await wait_msg.delete()
-                sent_msgs = []
-                for piece in parts:
-                    sent_msgs.append(await update.effective_chat.send_message(piece))
+                sent_msgs = await send_x_thread_text(update, chat_id, body, own, author)
                 if mode_of(chat_id) == "pro":
                     try:
                         await sent_msgs[-1].edit_reply_markup(
@@ -1082,6 +1095,23 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             await wait_msg.delete()
         except Exception:
             pass
+        # Photo posts: the author's continuation captions are self-replies in the
+        # comments. Merge them exactly like the text-only path — the album keeps
+        # the main caption, the follow-up captions arrive as their own message(s).
+        try:
+            thread = await asyncio.to_thread(x_thread_texts, tweet_id)
+            if thread and len(thread) > 1:
+                author = await asyncio.to_thread(x_tweet_author, tweet_id)
+                cont_sent = await send_x_thread_text(
+                    update, chat_id, "\n\n".join(thread[1:]), "", author)
+                if cont_sent and mode_of(chat_id) == "pro":
+                    try:
+                        await cont_sent[-1].edit_reply_markup(
+                            reply_markup=await add_share(update, cont_sent, "thread"))
+                    except Exception:
+                        log.exception("share kb attach failed (photo thread)")
+        except Exception:
+            log.exception("photo thread continuation failed (album already sent)")
         if failed:
             await update.message.reply_text(f"✅ عکس‌ها ارسال شد.{failed_note}")
     except Exception as e:
