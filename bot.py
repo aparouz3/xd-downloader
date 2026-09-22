@@ -305,12 +305,8 @@ def x_tweet_author(tweet_id: str) -> str:
     return (author.get("name") or "").strip()
 
 
-def x_thread_texts(tweet_id: str) -> list[str]:
-    """Full unrolled thread texts via threadreaderapp.com (best-effort).
-
-    Returns [] when the thread was never unrolled (site redirects to login)
-    or on any network error. Caller falls back to the single-tweet text.
-    """
+def _x_thread_texts_threadreader(tweet_id: str) -> list[str]:
+    """Unrolled thread texts via threadreaderapp only (best-effort)."""
     import html as _html
     try:
         req = urllib.request.Request(
@@ -333,6 +329,90 @@ def x_thread_texts(tweet_id: str) -> list[str]:
         t = _html.unescape(re.sub(r"<[^>]+>", "", b)).strip()
         if t:
             texts.append(t)
+    return texts
+
+NITTER_INSTANCES = ["nitter.lol", "nitter.privacyredirect.com", "nitter.tiekoetter.com", "nitter.poast.org"]
+
+
+def x_tweet_author_handle(tweet_id: str) -> str:
+    """@-less screen_name of a post's author via fxtwitter ('' on failure)."""
+    data = fetch_x_tweet(tweet_id)
+    author = ((data or {}).get("tweet") or {}).get("author") or {}
+    return (author.get("screen_name") or "").strip()
+
+
+def _nitter_thread(tweet_id: str, handle: str) -> list[str]:
+    """Author's own tweets inside the conversation, via a live nitter instance."""
+    import html as _html
+    if not handle:
+        return []
+    for inst in NITTER_INSTANCES:
+        try:
+            req = urllib.request.Request(
+                f"https://{inst}/{handle}/status/{tweet_id}",
+                headers={"User-Agent": BROWSER_UA})
+            page = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
+            if "not a bot" in page or "Not a robot" in page or "Just a moment" in page:
+                continue
+            items = re.findall(
+                r'<div class="timeline-item[^"]*"[^>]*>(.*?)(?=<div class="timeline-item|<footer)',
+                page, re.S)
+            out = []
+            for it in items:
+                m = re.search(r'class="username[^"]*"[^>]*>@([A-Za-z0-9_]+)', it)
+                if not m or m.group(1).lower() != handle.lower():
+                    continue
+                t = re.search(r'<div class="tweet-content[^>]*>(.*?)</div>', it, re.S)
+                if not t:
+                    continue
+                b = re.sub(r"<br\s*/?>", "\n", t.group(1))
+                txt = _html.unescape(re.sub(r"<[^>]+>", "", b)).strip()
+                if txt:
+                    out.append(txt)
+            if out:
+                return out
+        except Exception as e:
+            log.warning("nitter %s failed for %s: %s", inst, tweet_id, e)
+            continue
+    return []
+
+
+def _x_thread_from_fxtwitter(tweet_id: str) -> list[str]:
+    """Author's continuation via fxtwitter's ``thread`` field (user-routed URL).
+
+    fxtwitter returns ``tweet.thread`` = the rest of the author's own thread when
+    the post is part of one — same no-auth API per media as for captions/photos.
+    """
+    handle = x_tweet_author_handle(tweet_id)
+    if not handle:
+        return []
+    try:
+        req = urllib.request.Request(
+            f"https://api.fxtwitter.com/{handle}/status/{tweet_id}",
+            headers={"User-Agent": BROWSER_UA})
+        data = json.loads(urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore"))
+    except Exception as e:
+        log.warning("fxtwitter thread failed for %s: %s", tweet_id, e)
+        return []
+    th = (((data or {}).get("tweet")) or {}).get("thread")
+    if not isinstance(th, list):
+        return []
+    return [t.get("text", "").strip() for t in th if (t.get("text") or "").strip()]
+
+
+def x_thread_texts(tweet_id: str) -> list[str]:
+    """Author's own unrolled thread texts for a post.
+
+    Sources, in order: fxtwitter ``tweet.thread`` (author continuation, media-safe)
+    → threadreader (unrolled thread) → nitter conversation (author's own tweets).
+    The root tweet is the first element when it carries text; callers that
+    already render the root caption (photo path) drop it by comparing vs caption.
+    """
+    texts = _x_thread_from_fxtwitter(tweet_id)
+    if not texts:
+        texts = _x_thread_texts_threadreader(tweet_id)
+    if not texts:
+        texts = _nitter_thread(tweet_id, x_tweet_author_handle(tweet_id))
     return texts
 
 
@@ -1100,10 +1180,13 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
         # the main caption, the follow-up captions arrive as their own message(s).
         try:
             thread = await asyncio.to_thread(x_thread_texts, tweet_id)
-            if thread and len(thread) > 1:
+            # The root caption is already on the album; drop it (exact match) and
+            # keep the author's follow-up self-replies as the continuation.
+            cont = [t for t in thread if t and t != post_text]
+            if cont:
                 author = await asyncio.to_thread(x_tweet_author, tweet_id)
                 cont_sent = await send_x_thread_text(
-                    update, chat_id, "\n\n".join(thread[1:]), "", author)
+                    update, chat_id, "\n\n".join(cont), "", author)
                 if cont_sent and mode_of(chat_id) == "pro":
                     try:
                         await cont_sent[-1].edit_reply_markup(
