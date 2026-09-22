@@ -359,8 +359,11 @@ def _nitter_thread(tweet_id: str, handle: str) -> list[str]:
                 page, re.S)
             out = []
             for it in items:
-                m = re.search(r'class="username[^"]*"[^>]*>@([A-Za-z0-9_]+)', it)
-                if not m or m.group(1).lower() != handle.lower():
+                # The item's OWN author lives in its tweet-link permalink
+                # (/AUTHOR/status/…); the in-text @username is unreliable here
+                # because replies mention the main handle first.
+                link = re.search(r'<a class="tweet-link" href="/([^/]+)/status/\d+', it)
+                if not link or link.group(1).lower() != handle.lower():
                     continue
                 t = re.search(r'<div class="tweet-content[^>]*>(.*?)</div>', it, re.S)
                 if not t:
