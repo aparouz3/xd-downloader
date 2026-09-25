@@ -1197,6 +1197,13 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             merged = ([album_caption] + selfrep) if album_caption else selfrep
             album_caption = "\n\n".join(merged)
         album_caption = album_caption[:1024]
+        # Pro mode: the fixed signature line goes under EVERY post — one Enter
+        # after the caption, then the constant 📬 line.
+        if mode_of(chat_id) == "pro":
+            author = await asyncio.to_thread(x_tweet_author, tweet_id)
+            sig = author_line(author)
+            if sig:
+                album_caption = (album_caption + "\n" + sig)[:1024]
         tmpdir = os.path.dirname(paths[0])
         await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
 
@@ -1273,11 +1280,11 @@ async def do_x_video_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_
         post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
         author = sanitize_caption(await asyncio.to_thread(x_tweet_author, tweet_id))
         own = user_note(user_caption)
-        if own:
-            caption = own
-        else:
-            parts = [p for p in (post_text, author_line(author)) if p]
-            caption = "\n".join(parts)[:1024] or "🐦 ویدیوی X"
+        # Signature line under EVERY pro post, even when the user's own note is
+        # the caption — one Enter after the caption, then the constant 📬 line.
+        base = own or post_text
+        parts = [p for p in (base, author_line(author)) if p]
+        caption = "\n".join(parts)[:1024] or "🐦 ویدیوی X"
         with open(path, "rb") as fh:
             sent = await update.effective_chat.send_video(
                 video=fh, caption=caption, supports_streaming=True)
@@ -1364,6 +1371,12 @@ async def do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str,
         fallback = os.path.splitext(os.path.basename(path or ""))[0][:60]
         # user's own note (text besides the link) > post caption > filename
         caption = user_note(user_caption) or post_caption or fallback
+        # Pro mode: the fixed signature line goes under EVERY post — one Enter
+        # after the caption, then the constant 📬 line (uploader from yt-dlp).
+        if mode_of(chat_id) == "pro" and not audio_only:
+            sig = author_line(fetch_post_meta(url)[1])
+            if sig:
+                caption = (caption + "\n" + sig)[:1024]
         if size > DOC_LIMIT:
             await wait_msg.edit_text(
                 f"❌ فایل {size // (1024*1024)}MB است — بزرگ‌تر از سقف ۵۰MB تلگرام.\n"
