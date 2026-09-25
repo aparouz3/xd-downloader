@@ -341,8 +341,12 @@ def x_tweet_author_handle(tweet_id: str) -> str:
     return (author.get("screen_name") or "").strip()
 
 
-def _nitter_thread(tweet_id: str, handle: str) -> list[str]:
-    """Author's own tweets inside the conversation, via a live nitter instance."""
+def _nitter_own_tweets(tweet_id: str, handle: str) -> list[tuple[str, str]]:
+    """(status_id, text) of the AUTHOR's OWN tweets in the conversation (root excluded).
+
+    The item's own author lives in its tweet-link permalink (/AUTHOR/status/…);
+    the in-text @username is unreliable — replies echo the main handle first.
+    """
     import html as _html
     if not handle:
         return []
@@ -359,11 +363,11 @@ def _nitter_thread(tweet_id: str, handle: str) -> list[str]:
                 page, re.S)
             out = []
             for it in items:
-                # The item's OWN author lives in its tweet-link permalink
-                # (/AUTHOR/status/…); the in-text @username is unreliable here
-                # because replies mention the main handle first.
-                link = re.search(r'<a class="tweet-link" href="/([^/]+)/status/\d+', it)
+                link = re.search(r'<a class="tweet-link" href="/([^/]+)/status/(\d+)', it)
                 if not link or link.group(1).lower() != handle.lower():
+                    continue
+                sid = link.group(2)
+                if sid == tweet_id:
                     continue
                 t = re.search(r'<div class="tweet-content[^>]*>(.*?)</div>', it, re.S)
                 if not t:
@@ -371,13 +375,48 @@ def _nitter_thread(tweet_id: str, handle: str) -> list[str]:
                 b = re.sub(r"<br\s*/?>", "\n", t.group(1))
                 txt = _html.unescape(re.sub(r"<[^>]+>", "", b)).strip()
                 if txt:
-                    out.append(txt)
+                    out.append((sid, txt))
             if out:
                 return out
         except Exception as e:
             log.warning("nitter %s failed for %s: %s", inst, tweet_id, e)
             continue
     return []
+
+
+def _nitter_thread(tweet_id: str, handle: str) -> list[str]:
+    """Author's own tweets' texts in the conversation (root excluded), via nitter."""
+    return [t for _, t in _nitter_own_tweets(tweet_id, handle)]
+
+
+def x_self_reply_continuation(tweet_id: str) -> list[str]:
+    """The author's OWN SELF-REPLIES that continue the post's caption, in order.
+
+    A self-reply is an author tweet whose reply parent is this root post — the
+    author completing their cut-off caption. Replies the author wrote to OTHER
+    people's comments are excluded. Nitter provides the conversation (ids + text),
+    fxtwitter resolves each reply's parent. Returns [] when none.
+    """
+    handle = x_tweet_author_handle(tweet_id)
+    if not handle:
+        return []
+    pairs = _nitter_own_tweets(tweet_id, handle)
+    if not pairs:
+        return []
+    out = []
+    for sid, text in pairs:
+        try:
+            req = urllib.request.Request(
+                f"https://api.fxtwitter.com/{handle}/status/{sid}",
+                headers={"User-Agent": BROWSER_UA})
+            body = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "ignore")
+            tw = (json.loads(body).get("tweet")) or {}
+        except Exception as e:
+            log.warning("fxtwitter parent check failed for %s: %s", sid, e)
+            continue
+        if tw.get("replying_to_status") == tweet_id:
+            out.append(text)
+    return out
 
 
 def _x_thread_from_fxtwitter(tweet_id: str) -> list[str]:
@@ -1148,7 +1187,16 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
         # Album caption: user's own note > post text from fxtwitter.
         post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
         own = user_note(user_caption)
+        # The author often completes the caption in their OWN self-replies (the
+        # tweet text can be cut mid-sentence). Merge those into the SINGLE album
+        # caption — replies the author wrote to other people's comments are
+        # excluded. One message, not two.
+        selfrep = await asyncio.to_thread(x_self_reply_continuation, tweet_id)
         album_caption = own or post_text
+        if selfrep:
+            merged = ([album_caption] + selfrep) if album_caption else selfrep
+            album_caption = "\n\n".join(merged)
+        album_caption = album_caption[:1024]
         tmpdir = os.path.dirname(paths[0])
         await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
 
@@ -1178,28 +1226,10 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             await wait_msg.delete()
         except Exception:
             pass
-        # Photo posts: the author's continuation captions are self-replies in the
-        # comments. Merge them exactly like the text-only path — the album keeps
-        # the main caption, the follow-up captions arrive as their own message(s).
-        try:
-            thread = await asyncio.to_thread(x_thread_texts, tweet_id)
-            # The root caption is already on the album; drop it (exact match) and
-            # keep the author's follow-up self-replies as the continuation.
-            cont = [t for t in thread if t and t != post_text]
-            if cont:
-                author = await asyncio.to_thread(x_tweet_author, tweet_id)
-                cont_sent = await send_x_thread_text(
-                    update, chat_id, "\n\n".join(cont), "", author)
-                if cont_sent and mode_of(chat_id) == "pro":
-                    try:
-                        await cont_sent[-1].edit_reply_markup(
-                            reply_markup=await add_share(update, cont_sent, "thread"))
-                    except Exception:
-                        log.exception("share kb attach failed (photo thread)")
-        except Exception:
-            log.exception("photo thread continuation failed (album already sent)")
+        # Photo posts: self-reply continuations are already merged into the single
+        # album_caption above. No extra continuation messages sent.
         if failed:
-            await update.message.reply_text(f"✅ عکس‌ها ارسال شد.{failed_note}")
+            await update.message.reply_text(f"✅ عکسها ارسال شد.{failed_note}")
     except Exception as e:
         log.exception("x photos failed")
         try:
