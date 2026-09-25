@@ -446,15 +446,17 @@ def x_thread_texts(tweet_id: str) -> list[str]:
     """Author's own unrolled thread texts for a post.
 
     Sources, in order: fxtwitter ``tweet.thread`` (author continuation, media-safe)
-    → threadreader (unrolled thread) → nitter conversation (author's own tweets).
-    The root tweet is the first element when it carries text; callers that
-    already render the root caption (photo path) drop it by comparing vs caption.
+    → threadreader (unrolled thread) → author's self-replies on X/Nitter.
+    The root tweet text is included as first element when present.
     """
     texts = _x_thread_from_fxtwitter(tweet_id)
     if not texts:
         texts = _x_thread_texts_threadreader(tweet_id)
     if not texts:
-        texts = _nitter_thread(tweet_id, x_tweet_author_handle(tweet_id))
+        root = x_tweet_caption(tweet_id)
+        selfrep = x_self_reply_continuation(tweet_id)
+        if root or selfrep:
+            texts = ([root] if root else []) + selfrep
     return texts
 
 
@@ -1196,14 +1198,14 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
         if selfrep:
             merged = ([album_caption] + selfrep) if album_caption else selfrep
             album_caption = "\n\n".join(merged)
-        album_caption = album_caption[:1024]
+        author = await asyncio.to_thread(x_tweet_author, tweet_id)
         # Pro mode: the fixed signature line goes under EVERY post — one Enter
         # after the caption, then the constant 📬 line.
         if mode_of(chat_id) == "pro":
-            author = await asyncio.to_thread(x_tweet_author, tweet_id)
             sig = author_line(author)
             if sig:
-                album_caption = (album_caption + "\n" + sig)[:1024]
+                album_caption = album_caption + "\n" + sig
+        album_caption = album_caption[:1024]
         tmpdir = os.path.dirname(paths[0])
         await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
 
