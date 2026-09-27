@@ -77,8 +77,8 @@ BROWSER_UA = (
 )
 ACTIVE = set()               # chat ids currently downloading
 PENDING_URL = {}             # chat_id -> {"url", "msg_id", "user_caption"} awaiting quality choice
-# Download mode per chat: "quick" (auto 720p, caption, no questions) or
-# "pro" (send caption + author, then ask quality). Default = pro (old behavior).
+# Download mode per chat: "quick" (auto 1080p-or-best, caption, no questions)
+# or "pro" (send caption + author, then ask quality). Default = pro.
 MODES = {}
 # --- "ارسال به کانال" (share to channel) ---
 SHARE_CHANNEL = "@twitteology"
@@ -86,7 +86,9 @@ SHARES: dict[str, dict] = {}   # key -> {chat_id, message_ids, kind}
 _share_seq = count()
 MODE_QUICK = "⚡ سریع"
 MODE_PRO = "🎬 حرفه‌ای"
-QUICK_QUALITY = "720p"
+# Quick mode: 1080p first; the format selectors fall back to lower
+# qualities (or best) automatically when 1080p doesn't exist.
+QUICK_QUALITY = "1080p"
 
 def mode_kb(chat_id):
     return ReplyKeyboardMarkup(
@@ -109,8 +111,12 @@ def _share_payload(msgs) -> list[dict]:
     out = []
     for m in msgs:
         if m.video:
+            # PTB Video has no supports_streaming attribute (it's a send-time
+            # param only) — reading it raised AttributeError and silently
+            # killed the share button on video posts.
             out.append({"kind": "video", "file_id": m.video.file_id,
-                        "caption": m.caption, "supports_streaming": m.video.supports_streaming})
+                        "caption": m.caption,
+                        "supports_streaming": getattr(m.video, "supports_streaming", True)})
         elif m.photo:
             out.append({"kind": "photo", "file_id": m.photo[-1].file_id, "caption": m.caption})
         elif m.audio:
@@ -296,6 +302,40 @@ AUTHOR_LINE_TMPL = "📬 @twitteology┆ {name}"
 def author_line(name: str) -> str:
     """Signature author line appended below captions (handle/emoji constant)."""
     return AUTHOR_LINE_TMPL.format(name=name.strip()) if name and name.strip() else ""
+
+
+def _link_safe_truncate(text: str, limit: int = 1024) -> str:
+    """Trim to [limit] chars WITHOUT cutting a URL mid-way.
+
+    Telegram caps captions at 1024 chars; a blind [:1024] slice can amputate
+    a link that ends the caption — the link then looks 'gone'. When the cut
+    lands inside the last URL, the URL is dropped whole instead (the rest of
+    the caption is kept). No URL = no change.
+    """
+    if not text or len(text) <= limit:
+        return text
+    cut = text[:limit]
+    tail = cut[-300:]
+    m = re.search(r"https?://\S+", tail)
+    if m:
+        drop_from = len(cut) - (len(tail) - m.start())
+        cut = cut[:drop_from].rstrip()
+    return cut
+
+
+def _sig_parts(body: str, author: str, pro: bool) -> list:
+    """Caption body + optional signature, with a BLANK LINE between them.
+
+    Pro mode: the constant 📬 line always goes under the post, separated by
+    one empty line (Enter). Quick mode: body only, no signature.
+    """
+    parts = [p for p in (body.strip(),) if p]
+    if pro:
+        sig = author_line(author)
+        if sig:
+            parts.append("")      # blank line: Enter between caption and 📬
+            parts.append(sig)
+    return parts
 
 
 def x_tweet_author(tweet_id: str) -> str:
@@ -692,7 +732,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "🎬 لینک بفرست، ویدیو تحویل بگیر\n\n"
-        "• ⚡ سریع: دانلود خودکار با کیفیت خوب (۷۲۰p) + کپشن — بدون سوال\n"
+        "• ⚡ سریع: دانلود خودکار (۱۰۸۰p یا بهترین موجود) + کپشن — بدون سوال\n"
         "• 🎬 حرفه‌ای: اول کپشن و نام author پست، بعد انتخاب کیفیت\n"
         "• با دکمه‌های پایین می‌تونی حالت رو عوض کنی\n"
         "• یوتیوب / X / اینستاگرام / تیک‌تاک / ردیت و ۱۰۰۰+ سایت دیگه\n"
@@ -989,12 +1029,7 @@ async def on_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         info_author = await asyncio.to_thread(x_tweet_author, tid)
     else:
         info_cap, info_author = await asyncio.to_thread(fetch_post_meta, url)
-    lines = []
-    if info_cap:
-        lines.append(info_cap[:500])
-    sig = author_line(info_author)
-    if sig:
-        lines.append(sig)
+    lines = _sig_parts(info_cap[:500], info_author, pro=True)
     await info.edit_text("\n".join(lines) if lines else "ℹ️ اطلاعات افزوده‌ای برای این پست پیدا نشد.")
     await ask_quality(update, url, user_caption=text)
 
@@ -1084,7 +1119,8 @@ async def send_x_thread_text(update: Update, chat_id: int, body: str,
             cur = para + "\n\n"
         else:
             cur += add
-    cur = (cur.strip() + ("\n" + sig if sig else "")).strip()
+    # Blank line before the 📬 line (pro), then the signature on the last chunk.
+    cur = (cur.strip() + ("\n\n" + sig if sig else "")).strip()
     parts.append(cur)
     if own:
         parts[0] = own + "\n\n" + parts[0]
@@ -1165,14 +1201,15 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
                         log.exception("share kb attach failed")
                 return
             if post_text:
-                sig2 = author_line(author) if mode_of(chat_id) == "pro" else ""
+                # Blank line between the caption and the 📬 line (pro).
                 # Edit FIRST (updates wait_msg), then snapshot for share —
                 # evaluating add_share inside the edit_text() args would capture
                 # the pre-edit placeholder text instead of the post itself.
                 # edit_text returns the UPDATED Message object (the old variable
                 # keeps the placeholder text) — must rebind before snapshotting.
                 wait_msg = await wait_msg.edit_text(
-                    "\n".join(p2 for p2 in (own or post_text, sig2) if p2))
+                    "\n".join(_sig_parts(own or post_text, author,
+                                         mode_of(chat_id) == "pro")))
                 if mode_of(chat_id) == "pro":
                     kb = await add_share(update, wait_msg, "text")
                     wait_msg = await wait_msg.edit_reply_markup(reply_markup=kb)
@@ -1199,13 +1236,12 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             merged = ([album_caption] + selfrep) if album_caption else selfrep
             album_caption = "\n\n".join(merged)
         author = await asyncio.to_thread(x_tweet_author, tweet_id)
-        # Pro mode: the fixed signature line goes under EVERY post — one Enter
-        # after the caption, then the constant 📬 line.
-        if mode_of(chat_id) == "pro":
-            sig = author_line(author)
-            if sig:
-                album_caption = album_caption + "\n" + sig
-        album_caption = album_caption[:1024]
+        # Pro mode: the fixed signature line goes under EVERY post — one blank
+        # line after the caption, then the constant 📬 line.
+        album_caption = "\n".join(_sig_parts(album_caption, author,
+                                              mode_of(chat_id) == "pro"))
+        # Trim to the 1024-char caption cap without amputating a link mid-URL.
+        album_caption = _link_safe_truncate(album_caption)
         tmpdir = os.path.dirname(paths[0])
         await ctx.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
 
@@ -1282,11 +1318,12 @@ async def do_x_video_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_
         post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
         author = sanitize_caption(await asyncio.to_thread(x_tweet_author, tweet_id))
         own = user_note(user_caption)
-        # Signature line under EVERY pro post, even when the user's own note is
-        # the caption — one Enter after the caption, then the constant 📬 line.
+        # Signature line under EVERY pro post — blank line after the caption,
+        # then the constant 📬 line. Link-safe trim at the 1024-char cap.
         base = own or post_text
-        parts = [p for p in (base, author_line(author)) if p]
-        caption = "\n".join(parts)[:1024] or "🐦 ویدیوی X"
+        caption = _link_safe_truncate(
+            "\n".join(_sig_parts(base, author, mode_of(chat_id) == "pro"))
+        ) or "🐦 ویدیوی X"
         with open(path, "rb") as fh:
             sent = await update.effective_chat.send_video(
                 video=fh, caption=caption, supports_streaming=True)
@@ -1373,12 +1410,12 @@ async def do_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str,
         fallback = os.path.splitext(os.path.basename(path or ""))[0][:60]
         # user's own note (text besides the link) > post caption > filename
         caption = user_note(user_caption) or post_caption or fallback
-        # Pro mode: the fixed signature line goes under EVERY post — one Enter
+        # Pro mode: the fixed signature line goes under EVERY post — blank line
         # after the caption, then the constant 📬 line (uploader from yt-dlp).
+        # Link-safe trim at the 1024-char caption cap.
         if mode_of(chat_id) == "pro" and not audio_only:
-            sig = author_line(fetch_post_meta(url)[1])
-            if sig:
-                caption = (caption + "\n" + sig)[:1024]
+            caption = _link_safe_truncate(
+                "\n".join(_sig_parts(caption, fetch_post_meta(url)[1], pro=True)))
         if size > DOC_LIMIT:
             await wait_msg.edit_text(
                 f"❌ فایل {size // (1024*1024)}MB است — بزرگ‌تر از سقف ۵۰MB تلگرام.\n"
