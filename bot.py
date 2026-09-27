@@ -430,12 +430,14 @@ def _nitter_thread(tweet_id: str, handle: str) -> list[str]:
 
 
 def x_self_reply_continuation(tweet_id: str) -> list[str]:
-    """The author's OWN SELF-REPLIES that continue the post's caption, in order.
+    """The author's OWN continuation of the post, in reading order.
 
-    A self-reply is an author tweet whose reply parent is this root post — the
-    author completing their cut-off caption. Replies the author wrote to OTHER
-    people's comments are excluded. Nitter provides the conversation (ids + text),
-    fxtwitter resolves each reply's parent. Returns [] when none.
+    Walks the author's SELF-REPLY CHAIN under this root post: the author
+    completes a cut-off caption in their own replies, which can themselves be
+    continued by further self-replies (a chain, not just direct replies).
+    Replies the author wrote to OTHER people's comments are excluded. Nitter
+    provides the conversation (ids + text), fxtwitter resolves each reply's
+    parent. Returns [] when none.
     """
     handle = x_tweet_author_handle(tweet_id)
     if not handle:
@@ -443,19 +445,43 @@ def x_self_reply_continuation(tweet_id: str) -> list[str]:
     pairs = _nitter_own_tweets(tweet_id, handle)
     if not pairs:
         return []
-    out = []
-    for sid, text in pairs:
+    text_of = {sid: txt for sid, txt in pairs}
+    # Resolve each author tweet's parent via fxtwitter, then build children map.
+    # Also prefer fxtwitter's text: it expands t.co short links into the FULL
+    # target URL, while nitter's rendered text truncates links
+    # ("marketplace.visualstudio.com…") — that truncation was exactly the
+    # "link vanishes" complaint.
+    children: dict[str, list[str]] = {}
+    for sid in text_of:
         try:
             req = urllib.request.Request(
                 f"https://api.fxtwitter.com/{handle}/status/{sid}",
                 headers={"User-Agent": BROWSER_UA})
             body = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "ignore")
             tw = (json.loads(body).get("tweet")) or {}
+            parent = tw.get("replying_to_status")
         except Exception as e:
             log.warning("fxtwitter parent check failed for %s: %s", sid, e)
             continue
-        if tw.get("replying_to_status") == tweet_id:
-            out.append(text)
+        if not parent:
+            continue
+        fx_text = (tw.get("text") or "").strip()
+        if fx_text:
+            text_of[sid] = fx_text
+        children.setdefault(parent, []).append(sid)
+    # DFS from the root, following the author's self-reply chain only.
+    # Children keep nitter's timeline order (already chronological).
+    out: list[str] = []
+    seen = set()
+    queue = [tweet_id]
+    while queue:
+        cur = queue.pop(0)
+        for child in children.get(cur, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            out.append(text_of[child])
+            queue.append(child)
     return out
 
 
@@ -1157,11 +1183,16 @@ async def do_x_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_id: 
             size = os.path.getsize(path)
             post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
             own = user_note(user_caption)
-            if own:
-                # user wrote their own note besides the link — use it
-                caption = own
-            elif post_text:
-                caption = post_text
+            # The author often continues the caption (or adds the promised
+            # link) in their OWN self-replies — merge those into the caption
+            # so links that live in the follow-up reply don't get lost.
+            selfrep = await asyncio.to_thread(x_self_reply_continuation, tweet_id)
+            body = own or post_text
+            if selfrep:
+                merged = ([body] + selfrep) if body else selfrep
+                body = "\n\n".join(merged)
+            if body:
+                caption = body
             else:
                 caption = f"🐦 ویدیوی X ({size // (1024*1024)}MB)" if size > 1024 * 1024 else "🐦 ویدیوی X"
             sent = None
@@ -1318,9 +1349,16 @@ async def do_x_video_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tweet_
         post_text = sanitize_caption(await asyncio.to_thread(x_tweet_caption, tweet_id))
         author = sanitize_caption(await asyncio.to_thread(x_tweet_author, tweet_id))
         own = user_note(user_caption)
+        # The author often continues the caption (or adds the promised link)
+        # in their OWN self-replies — merge the chain into the single caption
+        # so links that live in the follow-up reply don't get lost.
+        selfrep = await asyncio.to_thread(x_self_reply_continuation, tweet_id)
+        base = own or post_text
+        if selfrep:
+            merged = ([base] + selfrep) if base else selfrep
+            base = "\n\n".join(merged)
         # Signature line under EVERY pro post — blank line after the caption,
         # then the constant 📬 line. Link-safe trim at the 1024-char cap.
-        base = own or post_text
         caption = _link_safe_truncate(
             "\n".join(_sig_parts(base, author, mode_of(chat_id) == "pro"))
         ) or "🐦 ویدیوی X"
